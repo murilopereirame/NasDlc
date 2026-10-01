@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<xex>
+  <!-- System address range. Must not overlap other plugins
+       (gLoader uses 0x90D00000, XSolaceUnlocker uses 0x91D00000). -->
+  <baseaddr addr="0x91E00000"/>
+  <!-- Load as a system DLL, not as a title module. -->
+  <sysdll/>
+  <format>
+    <compressed/>
+  </format>
+  <mediatypes>
+    <default/>
+    <allpackages/>
+  </mediatypes>
+  <gameregion>
+    <all/>
+  </gameregion>
+</xex>

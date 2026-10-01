@@ -1,0 +1,27 @@
+# Visual Studio 2010 / XDK build output and caches
+ipch/
+*.sdf
+*.suo
+*.user
+*.opensdf
+Debug/
+Release/
+Release_LTCG/
+Profile/
+Profile_FastCap/
+CodeAnalysis/
+Xbox 360/
+*.obj
+*.pch
+*.pdb
+*.idb
+*.ilk
+*.lib
+*.exp
+*.xex
+*.xdb
+*.log
+*.tlog
+
+# Local xkelib checkout (see README, Build)
+xkelib/

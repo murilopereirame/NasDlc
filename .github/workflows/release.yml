@@ -1,0 +1,87 @@
+name: Build and release
+
+# Push a tag such as "v13" to build NasDlc.xex and publish a GitHub release.
+# Run the workflow by hand to only build (or give a tag to also release).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (for example v13). Leave empty to only build."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # The Xbox 360 XDK and Visual Studio 2010 cannot be installed on GitHub-hosted
+    # runners, so this job needs a self-hosted Windows runner that has
+    # Visual Studio 2010 + XDK 21256.3 installed.
+    runs-on: [self-hosted, Windows]
+    env:
+      # Path to xkelib on the runner (repository variable XKELIB_DIR).
+      # If it is empty, the project uses the "xkelib" folder next to NasDlc.sln.
+      XKELIB_DIR: ${{ vars.XKELIB_DIR }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Optional: clone xkelib from the repository named in the
+      # repository variable XKELIB_REPO (for example "owner/xkelib").
+      - name: Check out xkelib
+        if: ${{ vars.XKELIB_REPO != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.XKELIB_REPO }}
+          path: xkelib
+
+      - name: Build (Release|Xbox 360)
+        shell: powershell
+        run: |
+          $msbuild = "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe"
+          & $msbuild NasDlc.sln /t:Rebuild /p:Configuration=Release "/p:Platform=Xbox 360" /m /nologo /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect output
+        shell: powershell
+        run: |
+          $xex = Get-ChildItem -Path . -Recurse -Filter NasDlc.xex | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $xex) { Write-Error "NasDlc.xex not found"; exit 1 }
+          Write-Host "Found $($xex.FullName)"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item $xex.FullName dist\NasDlc.xex
+          Copy-Item NasDlc\NasDlc.ini dist\NasDlc.ini
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NasDlc
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: ${{ github.event_name == 'push' || inputs.tag != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: NasDlc
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            dist/NasDlc.xex
+            dist/NasDlc.ini
