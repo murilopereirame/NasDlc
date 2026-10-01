@@ -124,20 +124,6 @@ Command line build:
 %WINDIR%\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe NasDlc.sln /p:Configuration=Release "/p:Platform=Xbox 360"
 ```
 
-## Release
-
-The workflow `.github/workflows/release.yml` builds `NasDlc.xex` and publishes a GitHub release with release notes generated from the commits. `NasDlc.xex` and `NasDlc.ini` are attached to the release.
-
-- Push a tag to release: `git tag v13 && git push origin v13`.
-- Or run the workflow by hand (Actions tab). With a tag input it also releases; without it only builds (download the artifact from the run).
-
-The XDK cannot be installed on GitHub-hosted runners, so the build job needs a **self-hosted Windows runner** (labels `self-hosted`, `Windows`) with Visual Studio 2010 and XDK 21256.3. Repository variables (Settings → Secrets and variables → Actions → Variables):
-
-| Variable | Description |
-|---|---|
-| `XKELIB_DIR` | Path to xkelib on the runner. |
-| `XKELIB_REPO` | Optional. `owner/repo` of an xkelib repository to clone into `xkelib/` before the build. |
-
 ## Technical notes
 
 - All hooks pass every parameter as a raw 64-bit value. A type conversion breaks `NtQueryDirectoryFile` (the Xbox 360 version has no `FileInformationClass` parameter).
