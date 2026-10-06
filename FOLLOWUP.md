@@ -31,6 +31,22 @@ Status: version 13.2 is the release. DLC and lowercase title updates load from t
 
 ## 2. Parallel prefetch (medium priority)
 
+**Status: implemented in v13.3, not tested on the console.** Each test step below needs a log.
+
+**Test plan.**
+
+1. `[Log] Level = 2`, `[Cache] Verify = 1`, `[Speed] Prefetch = 1`, `PrefetchThreads = 2`.
+2. Start Guitar Hero 5. Open the Quickplay song list.
+3. Send `NasDlc.log`. Look at these lines:
+   - `prefetch: worker N listed M packages in X ms (R requests, ...)`: the listing speed of a worker thread. `R` near `M` means one entry per request. `last 80000006` is the normal end.
+   - `prefetch: worker N <pkg>: open X us, read = ..., Y us`: the request time of a worker. About 16600 us = one frame (the delay applies to workers too). About 600 us = no delay.
+   - `prefetch done: ... max P parallel requests`: `P` > 1 and short times mean that parallel requests are possible.
+   - `NAS listing done: 63 DLC entries in X ms, N from the prefetch`: the result. `N` near 63 means that XAM used the prefetched data.
+   - `MISMATCH`: must not occur.
+   - `prefetch: sharing conflict`: must not occur. If it occurs, send the log.
+4. Repeat with `PrefetchThreads = 4` and with `Prefetch = 0`, and compare the `NAS listing done` times.
+5. Check that all songs show and Guitar Hero II still loads its DLC.
+
 **Problem.** The listing takes about 360 ms per package (Guitar Hero 5: about 23 s for 63 packages). Most of it is the 16.6 ms per request delay in XAM threads.
 
 **Idea.** When the NAS listing returns a package name, put the path in a queue. 2 to 4 worker threads (system threads, like the watch thread) open the package read-only and fill the cache (`0-1000`) before XAM opens it. Then XAM's header reads come from memory.

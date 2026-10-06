@@ -27,7 +27,7 @@ The plugin changes only reads. It does not write to the NAS, and new files (for 
    plugin1 = Usb:\NasDlc.xex
    ```
 3. Change `NasContent` in `NasDlc.ini` to your server and share name.
-4. Start the console. You see the notification `NasDlc v13.2 active`, and later `NAS connected`.
+4. Start the console. You see the notification `NasDlc v13.3 active`, and later `NAS connected`.
 
 ## NAS folder structure
 
@@ -70,6 +70,8 @@ All settings are optional. A missing setting keeps its default value.
 | `[Log]` | `ContentTrace` | `0` | Diagnostic: log each XAM access to a `\Content\` path, on all devices. |
 | `[Cache]` | `Enabled` | `1` | Header cache. Set to `0` only for a problem search. |
 | `[Cache]` | `Verify` | `0` | Diagnostic: read from the NAS and compare with the cache (slower). |
+| `[Speed]` | `Prefetch` | `0` | Test feature: worker threads fill the cache of each NAS DLC package before XAM opens it. Needs `Cache.Enabled = 1`. |
+| `[Speed]` | `PrefetchThreads` | `2` | Number of prefetch worker threads (`1` to `4`). |
 
 Boolean values: `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`.
 
@@ -77,8 +79,8 @@ Boolean values: `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`.
 
 | Notification | Meaning |
 |---|---|
-| `NasDlc v13.2 active` | The hooks are installed. |
-| `NasDlc v13.2: hook count wrong` | The plugin could not install all hooks. It may not work. Send the log. |
+| `NasDlc v13.3 active` | The hooks are installed. |
+| `NasDlc v13.3: hook count wrong` | The plugin could not install all hooks. It may not work. Send the log. |
 | `NAS connected: DLC and title updates ready` | The NAS share is available. |
 | `NAS: N DLC packages found` | The NAS gave XAM N packages for this game. |
 | `NAS: title update loaded` | XAM opened a title update on the NAS. |
@@ -170,4 +172,4 @@ A read hook works without code patches: copy the driver object, change the read 
 **Not implemented**
 
 - A read-ahead cache at the driver level could save about 3.5 frames per package (about 0.6 s for 10 packages). The plugin would have to complete kernel requests itself, so the risk was too high for this gain.
-- Parallel prefetch of all package caches during the listing was not tested.
+- Parallel prefetch of all package caches during the listing: version 13.3 adds it as a test feature (`Speed.Prefetch`, off by default). Test results are not available yet.

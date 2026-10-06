@@ -16,7 +16,7 @@ Context for Claude Code agents. Read this file and `FOLLOWUP.md` before you chan
 
 NasDlc is a DashLaunch plugin (system DLL, `.xex`) for the Xbox 360. It loads DLC (content type `00000002`) and title updates (`000B0000`) from a NAS share, so that they do not need space on the HDD.
 
-Current release: **version 13.2** (`NasDlc/nasdlc.cpp`). It works with Guitar Hero II (`415607E7`), Guitar Hero 5 (`41560840`) and Minecraft (`584111F7`).
+Current release: **version 13.2**. Version 13.3 (in test) adds the parallel prefetch (`Speed.Prefetch`, off by default) (`NasDlc/nasdlc.cpp`). It works with Guitar Hero II (`415607E7`), Guitar Hero 5 (`41560840`) and Minecraft (`584111F7`).
 
 ## Environment
 
@@ -53,6 +53,7 @@ The plugin patches the **kernel imports of XAM** (import table slot + call stub)
 7. **Notifications** (`XNotifyQueueUI`) are sent only from the watch thread, never from a hook.
 8. **Log.** Hooks only copy text into a memory buffer. The watch thread writes the file every 0.5 s, under `g_FileLock`.
 9. **Settings.** `UsbX:\NasDlc.ini` (see `README.md`).
+10. **Prefetch (v13.3, `Speed.Prefetch = 0` by default).** When XAM opens a NAS DLC folder, a worker thread lists the same folder with its own handle and queues each package. 1 to 4 worker threads (system threads) open each package read-only and fill `0-1000` of its cache entry. A worker stays max. 8 packages in front of XAM. The hooks only queue a folder; they never wait for a worker, except after a sharing violation on a package that a worker has open (max. 500 ms, then one retry). The queue is cancelled at each title change.
 
 ## Rules that you must not break
 
@@ -95,7 +96,7 @@ Details: section "Findings for later work" in `README.md`.
 
 | File | Content |
 |---|---|
-| `NasDlc/nasdlc.cpp` | Release source, version 13.2 |
+| `NasDlc/nasdlc.cpp` | Source, version 13.3 (13.2 + prefetch test feature) |
 | `NasDlc/NasDlc.xml` | XEX configuration |
 | `NasDlc/NasDlc.ini` | Sample settings |
 | `NasDlc.sln`, `NasDlc/NasDlc.vcxproj` | Visual Studio 2010 project |
