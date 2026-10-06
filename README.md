@@ -27,7 +27,7 @@ The plugin changes only reads. It does not write to the NAS, and new files (for 
    plugin1 = Usb:\NasDlc.xex
    ```
 3. Change `NasContent` in `NasDlc.ini` to your server and share name.
-4. Start the console. You see the notification `NasDlc v13 active`, and later `NAS connected`.
+4. Start the console. You see the notification `NasDlc v13.5 active`, and later `NAS connected`.
 
 ## NAS folder structure
 
@@ -63,10 +63,12 @@ All settings are optional. A missing setting keeps its default value.
 | `[Paths]` | `NasContent` | `\Network\Smb\DOCKER\XBOXSMB\Content\` | NAS content folder: `\Network\Smb\<server>\<share>\Content\` |
 | `[Content]` | `Dlc` | `1` | Load DLC from the NAS. |
 | `[Content]` | `TitleUpdates` | `1` | Load title updates from the NAS. |
+| `[Content]` | `TitleFolders` | `1` | Find DLC on the NAS also when the title folder `Content\0000000000000000\<TitleID>\` is not on the HDD. |
 | `[Notify]` | `Start` | `1` | Notifications "active" and "NAS connected". |
 | `[Notify]` | `Found` | `1` | Notifications "N DLC packages found" and "title update loaded". |
 | `[Log]` | `Level` | `1` | `0` = no log, `1` = important lines, `2` = all details. |
 | `[Log]` | `TuTrace` | `0` | Diagnostic: log each title update search of XAM. |
+| `[Log]` | `ContentTrace` | `0` | Diagnostic: log each XAM access to a `\Content\` path and each listing of a `\Content\` folder, on all devices. |
 | `[Cache]` | `Enabled` | `1` | Header cache. Set to `0` only for a problem search. |
 | `[Cache]` | `Verify` | `0` | Diagnostic: read from the NAS and compare with the cache (slower). |
 
@@ -76,8 +78,8 @@ Boolean values: `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`.
 
 | Notification | Meaning |
 |---|---|
-| `NasDlc v13 active` | The hooks are installed. |
-| `NasDlc v13: hook count wrong` | The plugin could not install all hooks. It may not work. Send the log. |
+| `NasDlc v13.5 active` | The hooks are installed. |
+| `NasDlc v13.5: hook count wrong` | The plugin could not install all hooks. It may not work. Send the log. |
 | `NAS connected: DLC and title updates ready` | The NAS share is available. |
 | `NAS: N DLC packages found` | The NAS gave XAM N packages for this game. |
 | `NAS: title update loaded` | XAM opened a title update on the NAS. |
@@ -168,4 +170,4 @@ A read hook works without code patches: copy the driver object, change the read 
 **Not implemented**
 
 - A read-ahead cache at the driver level could save about 3.5 frames per package (about 0.6 s for 10 packages). The plugin would have to complete kernel requests itself, so the risk was too high for this gain.
-- Parallel prefetch of all package caches during the listing was not tested.
+- Parallel prefetch of all package caches during the listing was tested (v13.3/v13.4, 4 worker threads) and removed: no gain. The worker requests complete one frame apart, also in parallel. The SMB path completes about one request per frame for the whole system.
