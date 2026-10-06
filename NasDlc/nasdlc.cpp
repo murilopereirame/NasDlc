@@ -1,4 +1,4 @@
-// NasDlc.cpp  (version 13.4)
+// NasDlc.cpp  (version 13.5)
 // DashLaunch plugin: load DLC (00000002) and title updates (000B0000) from the NAS.
 //
 // How it works: the plugin patches the kernel file imports of XAM.
@@ -15,12 +15,9 @@
 //                  many small header reads of XAM need few NAS requests.
 //                  Reads without an offset (current position) always go to
 //                  the NAS, because XAM sets that position with a seek.
-//  - Title folders: optional (Content.TitleFolders). NAS title folders and
+//  - Title folders: Content.TitleFolders (on by default). NAS title folders and
 //                  type folders are added to the HDD listings of
 //                  Content\<ID>\ and Content\<ID>\<TitleID>\.
-//  - Prefetch:     optional (Speed.Prefetch). Worker threads list each NAS DLC
-//                  folder and fill the cache of each package before XAM
-//                  opens it.
 //
 // All hooks pass every parameter through as a raw 64-bit value.
 // (Version 6 showed that a type conversion breaks NtQueryDirectoryFile.)
@@ -40,7 +37,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define PLUGIN_NAME   "NasDlc v13.4"
+#define PLUGIN_NAME   "NasDlc v13.5"
 
 // ---------------------------------------------------------------------------
 // Fixed values
@@ -100,8 +97,6 @@ typedef struct _CONFIG {
     BOOL titleFolders;               // Title folder fix: NAS title and type folders in HDD listings
     BOOL cache;                      // Header cache on/off
     BOOL cacheVerify;                // Diagnostic: compare cache data with NAS data
-    BOOL prefetch;                   // Fill the package caches with worker threads
-    int  pfThreads;                  // Number of prefetch worker threads (1 to 4)
 } CONFIG;
 
 static CONFIG g_Cfg;
@@ -126,11 +121,9 @@ static void ConfigDefaults()
     g_Cfg.logLevel    = 1;
     g_Cfg.tuTrace     = FALSE;
     g_Cfg.contentTrace = FALSE;
-    g_Cfg.titleFolders = FALSE;
+    g_Cfg.titleFolders = TRUE;
     g_Cfg.cache       = TRUE;
     g_Cfg.cacheVerify = FALSE;
-    g_Cfg.prefetch    = FALSE;
-    g_Cfg.pfThreads   = 2;
 }
 
 static char* Trim(char* s)
@@ -208,8 +201,6 @@ static void LoadConfig()
         else if (!_stricmp(full, "Log.ContentTrace"))    g_Cfg.contentTrace = ParseBool(val, g_Cfg.contentTrace);
         else if (!_stricmp(full, "Cache.Enabled"))       g_Cfg.cache       = ParseBool(val, g_Cfg.cache);
         else if (!_stricmp(full, "Cache.Verify"))        g_Cfg.cacheVerify = ParseBool(val, g_Cfg.cacheVerify);
-        else if (!_stricmp(full, "Speed.Prefetch"))      g_Cfg.prefetch    = ParseBool(val, g_Cfg.prefetch);
-        else if (!_stricmp(full, "Speed.PrefetchThreads")) { int v = atoi(val); if (v >= 1 && v <= 4) g_Cfg.pfThreads = v; }
         else g_IniUnknown++;
     }
 }
@@ -604,9 +595,6 @@ typedef struct _CACHEENT {
     BOOL  busy;         // A fill or copy is in progress
     DWORD gen;          // 0 = free entry
     DWORD lastUse;
-    BOOL  prefetched;   // A prefetch worker filled this entry
-    BOOL  opened;       // XAM opened this package (FileAdd)
-    DWORD pfTick;       // Tick of the prefetch fill
 } CACHEENT;
 
 typedef struct _NASFILE {
@@ -623,26 +611,18 @@ static CACHEENT      g_Cache[MAX_CACHE];
 static DWORD         g_CacheGen;
 static NASFILE       g_Files[MAX_FILES];
 static volatile LONG g_FileCount;
-static volatile LONG g_PfUsed;          // XAM opens of prefetched packages (this title)
 
 // Find or make the cache entry for a NAS path. The caller holds g_DirLock.
-// A prefetched entry that XAM did not open yet is replaced only if no other
-// entry can go.
 static int CacheSlot(const char* path)
 {
-    int freeSlot = -1, oldest = -1, oldestPf = -1;
+    int freeSlot = -1, oldest = -1;
     for (int i = 0; i < MAX_CACHE; i++) {
         CACHEENT* e = &g_Cache[i];
         if (e->gen && !_stricmp(e->path, path)) return i;
-        if (!e->gen) { if (freeSlot < 0) freeSlot = i; continue; }
-        if (e->busy) continue;
-        if (e->prefetched && !e->opened) {
-            if (oldestPf < 0 || e->lastUse < g_Cache[oldestPf].lastUse) oldestPf = i;
-        } else if (oldest < 0 || e->lastUse < g_Cache[oldest].lastUse) {
-            oldest = i;
-        }
+        if (!e->gen) { if (freeSlot < 0) freeSlot = i; }
+        else if (!e->busy && (oldest < 0 || e->lastUse < g_Cache[oldest].lastUse)) oldest = i;
     }
-    int i = freeSlot >= 0 ? freeSlot : oldest >= 0 ? oldest : oldestPf;
+    int i = freeSlot >= 0 ? freeSlot : oldest;
     if (i < 0) return -1;
     CACHEENT* e = &g_Cache[i];
     if (e->data) free(e->data);
@@ -685,11 +665,6 @@ static void FileAdd(HANDLE h, const char* path)
         strncpy(f->name, n, 8);
         f->cache = CacheSlot(path);
         f->gen = f->cache >= 0 ? g_Cache[f->cache].gen : 0;
-        if (f->cache >= 0) {
-            CACHEENT* e = &g_Cache[f->cache];
-            if (e->prefetched && !e->opened) g_PfUsed++;
-            e->opened = TRUE;
-        }
         g_FileCount++;
         break;
     }
@@ -750,409 +725,6 @@ static PFN8  g_pNtReadFile;
 
 static volatile BOOL g_NasReadOnly;     // TRUE after the first write open was denied
 static volatile DWORD g_CurTitle;       // Current title ID (set by the watch thread)
-
-// ---------------------------------------------------------------------------
-// Parallel prefetch (Speed.Prefetch, off by default)
-// ---------------------------------------------------------------------------
-// When XAM opens a NAS DLC folder, a worker lists the same folder with its own
-// handle. Then the workers open each package read-only and fill the first
-// CACHE_STAGE1 bytes of its cache entry, before XAM opens the package. XAM
-// then gets its header reads from memory.
-//  - Workers are system threads. They use only the original kernel functions
-//    and close their own handles.
-//  - The hooks only add a folder to the queue. They never wait for a worker.
-//    If a cache entry is busy, XAM reads from the NAS as before.
-//  - A worker stays at most PF_LEAD packages in front of XAM, so that the
-//    16 cache entries are not replaced before XAM uses them.
-//  - At each title change, the queue is cancelled.
-
-#define PF_MAX_THREADS  4
-#define PF_MAX_FOLDERS  8
-#define PF_QUEUE        128
-#define PF_LEAD         8            // Prefetched packages that XAM did not open yet
-#define PF_STALE_MS     3000         // After this time, such a package does not count
-#define PF_FILE_ACCESS  0x00120089   // Read-only (the same access as the read-only retry of XAM)
-#define PF_DIR_ACCESS   0x00100001   // SYNCHRONIZE | FILE_LIST_DIRECTORY
-#define PF_SHARE_ALL    7            // Share read, write, delete: never lock out XAM
-#define PF_FILE_OPTS    0x60         // FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE
-#define PF_DIR_OPTS     0x21         // FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
-#define ST_SHARING_VIOLATION ((NTSTATUS)0xC0000043)
-
-typedef struct _PFJOB {
-    DWORD gen;                 // g_PfGen when the job was queued
-    int   folder;              // Index in g_PfFolders
-    char  name[NAME_LEN];      // Package name. Empty = list the folder
-} PFJOB;
-
-static CRITICAL_SECTION g_PfLock;
-static DWORD   g_PfGen;                           // Changes at each title change
-static char    g_PfFolders[PF_MAX_FOLDERS][300];  // NAS folders of this title
-static int     g_PfFolderCount;
-static PFJOB   g_PfQueue[PF_QUEUE];
-static int     g_PfHead, g_PfTail;                // Jobs in the queue: tail - head
-static char    g_PfActive[PF_MAX_THREADS][300];   // Package that each worker has open
-
-// Statistics of one batch (from the first job to an empty queue). Under g_PfLock.
-static DWORD   g_PfStart;
-static int     g_PfQueued, g_PfDone, g_PfFilled, g_PfSkipped, g_PfFailed;
-static U64     g_PfOpenTicks, g_PfReadTicks;
-static volatile LONG g_PfInFlight, g_PfMaxInFlight;   // Parallel network requests
-
-static void PfNetBegin()
-{
-    LONG n = InterlockedIncrement(&g_PfInFlight);
-    LONG m;
-    while (n > (m = g_PfMaxInFlight))
-        if (InterlockedCompareExchange(&g_PfMaxInFlight, n, m) == m) break;
-}
-
-static void PfNetEnd() { InterlockedDecrement(&g_PfInFlight); }
-
-// The caller holds g_PfLock.
-static BOOL PfPushLocked(const PFJOB* j)
-{
-    if (g_PfTail - g_PfHead >= PF_QUEUE) return FALSE;
-    g_PfQueue[g_PfTail % PF_QUEUE] = *j;
-    g_PfTail++;
-    if (g_PfQueued == g_PfDone) {                     // New batch
-        g_PfStart = GetTickCount();
-        g_PfFilled = g_PfSkipped = g_PfFailed = 0;
-        g_PfOpenTicks = g_PfReadTicks = 0;
-        g_PfMaxInFlight = 0;
-    }
-    g_PfQueued++;
-    return TRUE;
-}
-
-// Get the next job and a copy of its folder path. FALSE = queue empty.
-static BOOL PfTake(PFJOB* j, char* folder)
-{
-    BOOL ok = FALSE;
-    EnterCriticalSection(&g_PfLock);
-    while (g_PfHead < g_PfTail) {
-        *j = g_PfQueue[g_PfHead % PF_QUEUE];
-        g_PfHead++;
-        if (j->gen != g_PfGen || j->folder >= g_PfFolderCount) { g_PfDone++; continue; }
-        strcpy(folder, g_PfFolders[j->folder]);
-        ok = TRUE;
-        break;
-    }
-    LeaveCriticalSection(&g_PfLock);
-    return ok;
-}
-
-static BOOL PfCancelled(DWORD gen) { return gen != g_PfGen; }
-
-// result: 1 = filled, 0 = skipped (cancelled or already in the cache), -1 = failed,
-//         2 = folder listed (not counted)
-static void PfJobDone(DWORD gen, int result, U64 openTicks, U64 readTicks)
-{
-    BOOL last = FALSE;
-    int  filled = 0, skipped = 0, failed = 0, maxPar = 0;
-    DWORD ms = 0, openUs = 0, readUs = 0;
-    EnterCriticalSection(&g_PfLock);
-    g_PfDone++;
-    if (gen == g_PfGen) {
-        if (result == 1)      g_PfFilled++;
-        else if (result == 0) g_PfSkipped++;
-        else if (result < 0)  g_PfFailed++;
-        g_PfOpenTicks += openTicks;
-        g_PfReadTicks += readTicks;
-    }
-    if (g_PfDone == g_PfQueued && g_PfStart) {
-        last    = TRUE;
-        filled  = g_PfFilled; skipped = g_PfSkipped; failed = g_PfFailed;
-        ms      = GetTickCount() - g_PfStart;
-        if (g_PfFilled) {
-            openUs = (DWORD)(g_PfOpenTicks / g_PfFilled / TB_PER_US);
-            readUs = (DWORD)(g_PfReadTicks / g_PfFilled / TB_PER_US);
-        }
-        maxPar  = (int)g_PfMaxInFlight;
-        g_PfStart = 0;
-    }
-    LeaveCriticalSection(&g_PfLock);
-    if (last)
-        Log("prefetch done: %d filled, %d skipped, %d failed in %u ms, "
-            "average open %u us, average read %u us, max %d parallel requests",
-            filled, skipped, failed, ms, openUs, readUs, maxPar);
-}
-
-// Hook side: queue a NAS DLC folder (once per title).
-static void PrefetchFolder(const char* path)
-{
-    if (!g_Cfg.prefetch) return;
-    BOOL added = FALSE, full = FALSE;
-    EnterCriticalSection(&g_PfLock);
-    int i;
-    for (i = 0; i < g_PfFolderCount; i++) if (!_stricmp(g_PfFolders[i], path)) break;
-    if (i == g_PfFolderCount) {
-        if (i < PF_MAX_FOLDERS) {
-            strncpy(g_PfFolders[i], path, sizeof(g_PfFolders[i]) - 1);
-            g_PfFolders[i][sizeof(g_PfFolders[i]) - 1] = 0;
-            g_PfFolderCount++;
-            PFJOB j;
-            j.gen = g_PfGen; j.folder = i; j.name[0] = 0;
-            added = PfPushLocked(&j);
-            full  = !added;
-        } else {
-            full = TRUE;
-        }
-    }
-    LeaveCriticalSection(&g_PfLock);
-    if (added) LogV("prefetch: folder queued %s", path);
-    if (full)  Log("prefetch: folder table or queue full, %s not prefetched", path);
-}
-
-// Hook side: if a worker has this package open, wait until it closes it
-// (max. 500 ms). TRUE = a worker had it open.
-static BOOL PrefetchWaitPath(const char* path)
-{
-    if (!g_Cfg.prefetch) return FALSE;
-    BOOL was = FALSE;
-    for (int n = 0; n < 100; n++) {
-        BOOL active = FALSE;
-        EnterCriticalSection(&g_PfLock);
-        for (int i = 0; i < PF_MAX_THREADS; i++)
-            if (g_PfActive[i][0] && !_stricmp(g_PfActive[i], path)) { active = TRUE; break; }
-        LeaveCriticalSection(&g_PfLock);
-        if (!active) break;
-        was = TRUE;
-        Sleep(5);
-    }
-    return was;
-}
-
-static void PfSetActive(int id, const char* path)
-{
-    EnterCriticalSection(&g_PfLock);
-    if (path) strcpy(g_PfActive[id], path); else g_PfActive[id][0] = 0;
-    LeaveCriticalSection(&g_PfLock);
-}
-
-static U64 PfOpen(HANDLE* ph, const char* path, DWORD access, DWORD opts)
-{
-    STRING            name;
-    OBJECT_ATTRIBUTES oa;
-    IO_STATUS_BLOCK   io;
-    RtlInitAnsiString(&name, path);
-    oa.RootDirectory = NULL;
-    oa.ObjectName    = &name;
-    oa.Attributes    = 0x40;                            // OBJ_CASE_INSENSITIVE
-    *ph = NULL;
-    return g_pNtOpenFile(RAW(ph), access, RAW(&oa), RAW(&io), PF_SHARE_ALL, opts);
-}
-
-// Worker: list a NAS folder and queue each package.
-static void PfListFolder(int id, const PFJOB* job, const char* folder)
-{
-    DWORD  t0 = GetTickCount();
-    HANDLE h;
-    U64 r = PfOpen(&h, folder, PF_DIR_ACCESS, PF_DIR_OPTS);
-    if (!NT_SUCCESS(STATUS(r)) || !h) {
-        Log("prefetch: folder open %s = %08X", folder, (DWORD)r);
-        PfJobDone(job->gen, -1, 0, 0);
-        return;
-    }
-
-    DWORD  buf[0x200];                                  // 2 KB, DWORD aligned
-    STRING mask;
-    RtlInitAnsiString(&mask, "*");
-    int files = 0, dropped = 0, requests = 0;
-    for (int guard = 0; guard < 512 && !PfCancelled(job->gen); guard++) {
-        IO_STATUS_BLOCK io;
-        io.Information = 0;
-        PfNetBegin();
-        r = g_pNtQueryDirectoryFile(RAW(h), 0, 0, 0, RAW(&io), RAW(buf), sizeof(buf),
-                                    guard ? 0 : RAW(&mask), 0, 0);
-        if (STATUS(r) == STATUS_PENDING) {
-            NtWaitForSingleObjectEx(h, 0, FALSE, NULL);
-            r = (U64)(DWORD)IOSB_STATUS(&io);
-        }
-        PfNetEnd();
-        requests++;
-        if (!NT_SUCCESS(STATUS(r))) break;              // Includes "no more files"
-
-        // One or more FILE_DIRECTORY_INFORMATION entries:
-        // NextEntryOffset at 0x00, FileAttributes at 0x38, FileNameLength at 0x3C, FileName at 0x40.
-        DWORD used = (DWORD)io.Information;
-        if (used > sizeof(buf)) used = sizeof(buf);
-        DWORD pos = 0;
-        while (pos + 0x40 <= used) {
-            BYTE* e    = (BYTE*)buf + pos;
-            DWORD next = *(DWORD*)(e + 0x00);
-            DWORD attr = *(DWORD*)(e + 0x38);
-            DWORD n    = *(DWORD*)(e + 0x3C);
-            if (n < NAME_LEN && pos + 0x40 + n <= used && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-                PFJOB fj;
-                memcpy(fj.name, e + 0x40, n);
-                fj.name[n] = 0;
-                if (fj.name[0] && !IsJunk(fj.name)) {
-                    fj.gen = job->gen; fj.folder = job->folder;
-                    EnterCriticalSection(&g_PfLock);
-                    BOOL ok = PfPushLocked(&fj);
-                    LeaveCriticalSection(&g_PfLock);
-                    if (ok) files++; else dropped++;
-                }
-            }
-            if (!next) break;
-            pos += next;
-        }
-    }
-    g_pNtClose(RAW(h));
-    Log("prefetch: worker %d listed %d packages in %u ms (%d requests, last %08X)%s, %s",
-        id, files, GetTickCount() - t0, requests, (DWORD)r,
-        dropped ? ", QUEUE FULL" : "", folder);
-    PfJobDone(job->gen, 2, 0, 0);
-}
-
-// Worker: open one package and fill the start of its cache entry.
-static void PfFillFile(int id, const PFJOB* job, const char* folder)
-{
-    char path[300];
-    size_t fl = strlen(folder);
-    const char* sep = (fl && folder[fl - 1] == '\\') ? "" : "\\";
-    if (_snprintf(path, sizeof(path) - 1, "%s%s%s", folder, sep, job->name) < 0) {
-        PfJobDone(job->gen, -1, 0, 0);
-        return;
-    }
-    path[sizeof(path) - 1] = 0;
-
-    // Wait while XAM is PF_LEAD packages behind. Stop if the cache has the data.
-    for (;;) {
-        if (PfCancelled(job->gen)) { PfJobDone(job->gen, 0, 0, 0); return; }
-        BOOL  have    = FALSE;
-        int   pending = 0;
-        DWORD now     = GetTickCount();
-        EnterCriticalSection(&g_DirLock);
-        for (int i = 0; i < MAX_CACHE; i++) {
-            CACHEENT* e = &g_Cache[i];
-            if (!e->gen) continue;
-            if (!_stricmp(e->path, path) && (e->have >= CACHE_STAGE1 || e->eof)) have = TRUE;
-            if (e->prefetched && !e->opened && now - e->pfTick < PF_STALE_MS) pending++;
-        }
-        LeaveCriticalSection(&g_DirLock);
-        if (have) { PfJobDone(job->gen, 0, 0, 0); return; }
-        if (pending < PF_LEAD) break;
-        Sleep(5);
-    }
-
-    U64 t0 = __mftb();
-    PfSetActive(id, path);
-    HANDLE h;
-    PfNetBegin();
-    U64 r = PfOpen(&h, path, PF_FILE_ACCESS, PF_FILE_OPTS);
-    PfNetEnd();
-    U64 openTicks = __mftb() - t0;
-    if (!NT_SUCCESS(STATUS(r)) || !h) {
-        PfSetActive(id, NULL);
-        Log("prefetch: worker %d open %s = %08X", id, job->name, (DWORD)r);
-        PfJobDone(job->gen, -1, openTicks, 0);
-        return;
-    }
-
-    // Claim the cache entry. If it is busy (XAM fills it now) or full, stop.
-    CACHEENT* e = NULL;
-    EnterCriticalSection(&g_DirLock);
-    int slot = PfCancelled(job->gen) ? -1 : CacheSlot(path);
-    if (slot >= 0) {
-        CACHEENT* c = &g_Cache[slot];
-        if (!c->busy && c->have < CACHE_STAGE1 && !c->eof) { c->busy = TRUE; e = c; }
-    }
-    LeaveCriticalSection(&g_DirLock);
-
-    int   result    = 0;
-    U64   readTicks = 0;
-    DWORD got       = 0;
-    if (e) {
-        if (!e->data) e->data = (BYTE*)malloc(CACHE_MAX);
-        if (e->data) {
-            IO_STATUS_BLOCK io;
-            LARGE_INTEGER   o;
-            o.QuadPart = e->have;
-            io.Information = 0;
-            U64 t1 = __mftb();
-            PfNetBegin();
-            r = g_pNtReadFile(RAW(h), 0, 0, 0, RAW(&io),
-                              RAW(e->data + e->have), CACHE_STAGE1 - e->have, RAW(&o));
-            if (STATUS(r) == STATUS_PENDING) {
-                NtWaitForSingleObjectEx(h, 0, FALSE, NULL);
-                r = (U64)(DWORD)IOSB_STATUS(&io);
-            }
-            PfNetEnd();
-            readTicks = __mftb() - t1;
-            if (NT_SUCCESS(STATUS(r))) {
-                got = (DWORD)io.Information;
-                e->have += got;
-                if (e->have < CACHE_STAGE1) e->eof = TRUE;
-                result = 1;
-            } else if (STATUS(r) == STATUS_END_OF_FILE) {
-                e->eof = TRUE;
-                result = 1;
-            } else {
-                result = -1;
-            }
-        } else {
-            result = -1;
-        }
-        EnterCriticalSection(&g_DirLock);
-        if (result > 0) { e->prefetched = TRUE; e->pfTick = GetTickCount(); }
-        e->lastUse = GetTickCount();
-        e->busy = FALSE;
-        LeaveCriticalSection(&g_DirLock);
-    }
-    g_pNtClose(RAW(h));
-    PfSetActive(id, NULL);
-
-    LogV("prefetch: worker %d %s: open %u us, read = %08X, %X bytes, %u us%s",
-         id, job->name, (DWORD)(openTicks / TB_PER_US), (DWORD)r, got,
-         (DWORD)(readTicks / TB_PER_US), e ? "" : " (cache entry not free)");
-    PfJobDone(job->gen, result, openTicks, readTicks);
-}
-
-static DWORD WINAPI PrefetchThread(LPVOID param)
-{
-    int   id = (int)(DWORD)param;
-    PFJOB job;
-    char  folder[300];
-    for (;;) {
-        if (!PfTake(&job, folder)) { Sleep(10); continue; }
-        if (!job.name[0]) PfListFolder(id, &job, folder);
-        else              PfFillFile(id, &job, folder);
-    }
-    return 0;
-}
-
-// Watch thread: cancel all jobs at a title change.
-static void PrefetchReset()
-{
-    if (!g_Cfg.prefetch) return;
-    EnterCriticalSection(&g_PfLock);
-    g_PfGen++;
-    g_PfDone += g_PfTail - g_PfHead;                    // Dropped jobs count as done
-    g_PfHead = g_PfTail = 0;
-    g_PfFolderCount = 0;
-    LeaveCriticalSection(&g_PfLock);
-    g_PfUsed = 0;
-}
-
-static void PrefetchStart()
-{
-    if (!g_Cfg.prefetch) return;
-    int started = 0;
-    for (int i = 0; i < g_Cfg.pfThreads && i < PF_MAX_THREADS; i++) {
-        HANDLE thread = NULL;
-        DWORD  threadId = 0;
-        ExCreateThread(&thread, 0, &threadId, (PVOID)XapiThreadStartup,
-                       (LPTHREAD_START_ROUTINE)PrefetchThread, (LPVOID)(DWORD)i,
-                       0x2 | CREATE_SUSPENDED);         // 0x2 = system thread
-        if (!thread) continue;
-        XSetThreadProcessor(thread, (i & 1) ? 4 : 5);
-        ResumeThread(thread);
-        CloseHandle(thread);
-        started++;
-    }
-    Log("prefetch: %d of %d worker threads started", started, g_Cfg.pfThreads);
-}
 
 // ---------------------------------------------------------------------------
 // Hooks
@@ -1510,7 +1082,6 @@ static U64 Hook_NtOpenFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 share, U64 
         if (NT_SUCCESS(STATUS(r2)) && hNas) {
             DirAdd(*(HANDLE*)PTR(ph), hNas, 0, np.type, np.buf);
             LogV("merge folder %s", np.buf);
-            if (np.type == TYPE_DLC) PrefetchFolder(np.buf);
         } else {
             LogV("merge folder %s = %08X (no NAS folder)", np.buf, (DWORD)r2);
         }
@@ -1529,11 +1100,6 @@ static U64 Hook_NtOpenFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 share, U64 
 
     U64 t0 = __mftb();
     U64 r2 = g_pNtOpenFile(ph, access, RAW(&np.oa), iosb, share, opts);
-    if (STATUS(r2) == ST_SHARING_VIOLATION && !isDir && PrefetchWaitPath(np.buf)) {
-        // A prefetch worker had the package open. It is closed now: try again.
-        r2 = g_pNtOpenFile(ph, access, RAW(&np.oa), iosb, share, opts);
-        Log("prefetch: sharing conflict on %s, second open = %08X", np.buf, (DWORD)r2);
-    }
     DWORD us = (DWORD)((__mftb() - t0) / TB_PER_US);
     LogV("NAS %s %s access %08X = %08X (%u us)",
          isDir ? "folder" : "open", np.buf, (DWORD)access, (DWORD)r2, us);
@@ -1550,7 +1116,6 @@ static U64 Hook_NtOpenFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 share, U64 
     HANDLE h = *(HANDLE*)PTR(ph);
     if (isDir) {
         DirAdd(h, NULL, 1, np.type, np.buf);
-        if (np.type == TYPE_DLC) PrefetchFolder(np.buf);
     } else {
         KnownAdd(np.buf);
         FileAdd(h, np.buf);
@@ -1579,17 +1144,11 @@ static U64 Hook_NtCreateFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 alloc,
     if (!BuildNas((POBJECT_ATTRIBUTES)PTR(oa), &np)) return r;
 
     U64 r2 = g_pNtCreateFile(ph, access, RAW(&np.oa), iosb, alloc, attr, share, disp, opts);
-    if (STATUS(r2) == ST_SHARING_VIOLATION && !((DWORD)opts & FILE_DIRECTORY_FILE) &&
-        PrefetchWaitPath(np.buf)) {
-        r2 = g_pNtCreateFile(ph, access, RAW(&np.oa), iosb, alloc, attr, share, disp, opts);
-        Log("prefetch: sharing conflict on %s, second create = %08X", np.buf, (DWORD)r2);
-    }
     LogV("NAS create %s access %08X = %08X", np.buf, (DWORD)access, (DWORD)r2);
     if (!NT_SUCCESS(STATUS(r2)))
         return STATUS(r2) == ST_ACCESS_DENIED ? r2 : r;
     if ((DWORD)opts & FILE_DIRECTORY_FILE) {
         DirAdd(*(HANDLE*)PTR(ph), NULL, 1, np.type, np.buf);
-        if (np.type == TYPE_DLC) PrefetchFolder(np.buf);
     } else {
         KnownAdd(np.buf);
         FileAdd(*(HANDLE*)PTR(ph), np.buf);
@@ -1654,9 +1213,9 @@ static U64 QueryDirectory(U64 h, U64 ev, U64 apc, U64 ctx, U64 iosb,
         U64 r = g_pNtQueryDirectoryFile(hq, ev, apc, ctx, iosb, info, len, mask, a9, a10);
         mask = 0;
         if (STATUS(r) == ST_NO_MORE_FILES && d->nasCount > 0) {
-            Log("NAS listing done: %d %s entries in %u ms, %d from the prefetch", d->nasCount,
+            Log("NAS listing done: %d %s entries in %u ms", d->nasCount,
                 d->type == TYPE_DLC ? "DLC" : "title update",
-                GetTickCount() - d->nasStart, (int)g_PfUsed);
+                GetTickCount() - d->nasStart);
             if (d->type == TYPE_DLC) ReportDlc(d->nasCount);
             d->nasCount = 0;                             // Report each scan once
         }
@@ -1990,7 +1549,6 @@ static DWORD WINAPI WatchThread(LPVOID)
     Log("XAM imports patched: %d hooks (expected %d)", hooked, (int)HOOK_COUNT);
     if (hooked != (int)HOOK_COUNT)   Notify(PLUGIN_NAME ": hook count wrong");
     else if (g_Cfg.notifyStart)      Notify(PLUGIN_NAME " active");
-    PrefetchStart();
     FlushLog();
 
     DWORD lastTitle = 0xFFFFFFFF, polls = 0;
@@ -2007,7 +1565,6 @@ static DWORD WINAPI WatchThread(LPVOID)
             lastTitle = tid;
             g_CurTitle = tid;
             Log("Title changed: %08X", tid);
-            PrefetchReset();
             CacheTrim(TRUE);
             g_FillHint  = 0;
             dlcNotified = FALSE;
@@ -2065,7 +1622,6 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD reason, LPVOID reserved)
     InitializeCriticalSection(&g_FileLock);
     InitializeCriticalSection(&g_DirLock);
     InitializeCriticalSection(&g_EventLock);
-    InitializeCriticalSection(&g_PfLock);
     MountUsbDrive();
     LoadConfig();
 
@@ -2073,14 +1629,9 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD reason, LPVOID reserved)
     if (g_IniState < 0) Log("No NasDlc.ini found: default settings");
     else                Log("NasDlc.ini read: %d settings, %d unknown", g_IniKeys, g_IniUnknown);
     Log("HDD %s -> NAS %s", g_Cfg.hddContent, g_Cfg.nasContent);
-    if (g_Cfg.prefetch && !g_Cfg.cache) {
-        Log("Speed.Prefetch needs Cache.Enabled = 1: prefetch off");
-        g_Cfg.prefetch = FALSE;
-    }
-    Log("DLC %d, title updates %d, notify start %d / found %d, log %d, TU trace %d, content trace %d, title folders %d, cache %d, verify %d, prefetch %d (%d threads)",
+    Log("DLC %d, title updates %d, notify start %d / found %d, log %d, TU trace %d, content trace %d, title folders %d, cache %d, verify %d",
         g_Cfg.dlc, g_Cfg.tu, g_Cfg.notifyStart, g_Cfg.notifyFound,
-        g_Cfg.logLevel, g_Cfg.tuTrace, g_Cfg.contentTrace, g_Cfg.titleFolders, g_Cfg.cache, g_Cfg.cacheVerify,
-        g_Cfg.prefetch, g_Cfg.pfThreads);
+        g_Cfg.logLevel, g_Cfg.tuTrace, g_Cfg.contentTrace, g_Cfg.titleFolders, g_Cfg.cache, g_Cfg.cacheVerify);
 
     if (!CacheExports()) {
         Log("Cannot read exports. Plugin inactive.");

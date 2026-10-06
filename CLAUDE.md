@@ -16,7 +16,7 @@ Context for Claude Code agents. Read this file and `FOLLOWUP.md` before you chan
 
 NasDlc is a DashLaunch plugin (system DLL, `.xex`) for the Xbox 360. It loads DLC (content type `00000002`) and title updates (`000B0000`) from a NAS share, so that they do not need space on the HDD.
 
-Current release: **version 13.2**. Version 13.3 (in test) adds the parallel prefetch (`Speed.Prefetch`, off by default). Version 13.4 (in test) adds the listing trace (`CT list` lines) and the title folder fix (`Content.TitleFolders`, off by default) (`NasDlc/nasdlc.cpp`). It works with Guitar Hero II (`415607E7`), Guitar Hero 5 (`41560840`) and Minecraft (`584111F7`).
+Current release: **version 13.5**: 13.2 + the title folder fix (`Content.TitleFolders`, on by default) + the listing trace (`CT list` lines with `Log.ContentTrace`). The prefetch of v13.3/v13.4 was removed (no gain) (`NasDlc/nasdlc.cpp`). It works with Guitar Hero II (`415607E7`), Guitar Hero 5 (`41560840`) and Minecraft (`584111F7`).
 
 ## Environment
 
@@ -37,10 +37,10 @@ Current release: **version 13.2**. Version 13.3 (in test) adds the parallel pref
 - XEX config: `NasDlc.xml` (`<sysdll/>`, base `0x91E00000`, compressed).
 - Ignored library: `kernelext.lib`. No precompiled headers. Deployment excluded.
 - Check with `xextool -l`: load address `91E00000`, DLL module.
-- Solution: `NasDlc.sln`, project `NasDlc/NasDlc.vcxproj`. On the user's VM, the project file may still be named `NasDlcTrace`. The `.cpp` in the project must contain the new code. **Always select Rebuild.** Check the version in the first log line (`==== NasDlc v13.2 loaded`).
+- Solution: `NasDlc.sln`, project `NasDlc/NasDlc.vcxproj`. On the user's VM, the project file may still be named `NasDlcTrace`. The `.cpp` in the project must contain the new code. **Always select Rebuild.** Check the version in the first log line (`==== NasDlc v13.5 loaded`).
 - **Address limit:** the plugin image is `0x3C000` bytes. An unknown module (the SMB filter driver) is at `0x91E80000`. The plugin must stay below it.
 
-## Architecture (version 13.2)
+## Architecture (version 13.5)
 
 The plugin patches the **kernel imports of XAM** (import table slot + call stub). Hooks: `NtOpenFile`, `NtCreateFile`, `NtQueryDirectoryFile`, `NtQueryFullAttributesFile`, `NtReadFile`, `NtClose`.
 
@@ -53,8 +53,7 @@ The plugin patches the **kernel imports of XAM** (import table slot + call stub)
 7. **Notifications** (`XNotifyQueueUI`) are sent only from the watch thread, never from a hook.
 8. **Log.** Hooks only copy text into a memory buffer. The watch thread writes the file every 0.5 s, under `g_FileLock`.
 9. **Settings.** `UsbX:\NasDlc.ini` (see `README.md`).
-10. **Prefetch (v13.3, `Speed.Prefetch = 0` by default).** When XAM opens a NAS DLC folder, a worker thread lists the same folder with its own handle and queues each package. 1 to 4 worker threads (system threads) open each package read-only and fill `0-1000` of its cache entry. A worker stays max. 8 packages in front of XAM. The hooks only queue a folder; they never wait for a worker, except after a sharing violation on a package that a worker has open (max. 500 ms, then one retry). The queue is cancelled at each title change.
-11. **Title folder fix (v13.4, `Content.TitleFolders = 0` by default).** Level 1: an HDD folder `Content\<ID>\` gets an extra NAS handle. After the last HDD entry, one NAS query with the mask `<current title ID>` (or the 8-hex mask of XAM) adds max. 1 entry. Level 2: `Content\<ID>\<TitleID>\` is merged the same way with the mask `00000002`. If the HDD title folder is missing, XAM gets the NAS title folder, and the listing uses the mask `00000002`. If the HDD listing already has the name, there is no NAS query. Code: `TitleFolderOpen`, `QueryLevel`.
+10. **Title folder fix (`Content.TitleFolders = 1` by default).** Level 1: an HDD folder `Content\<ID>\` gets an extra NAS handle. After the last HDD entry, one NAS query with the mask `<current title ID>` (or the 8-hex mask of XAM) adds max. 1 entry. Level 2: `Content\<ID>\<TitleID>\` is merged the same way with the mask `00000002`. If the HDD title folder is missing, XAM gets the NAS title folder, and the listing uses the mask `00000002`. If the HDD listing already has the name, there is no NAS query. Code: `TitleFolderOpen`, `QueryLevel`.
 
 ## Rules that you must not break
 
@@ -89,7 +88,7 @@ These come from real failures. Each one cost a test cycle.
 
 **Prefetch has no gain (v13.4, 4 threads).** Worker requests take 33 to 200 ms each. They complete one frame apart, also when 4 run in parallel: the SMB path completes about one request per frame for the whole system. Listing time: 23.9 s with prefetch, 23.4 s without (first listing); 11.9 s both (second listing). Parallel requests do not help.
 
-**Title folder problem.** Without `Hdd1\Content\0000000000000000\41560840\00000002\` on the HDD, Guitar Hero 5 never asked for this folder, and no DLC loaded. With the folder (one package in it), the merge worked. XAM probably checks a higher folder first. Workaround: create the empty folder. Fix: see `FOLLOWUP.md`.
+**Title folder problem.** Without `Hdd1\Content\0000000000000000\41560840\00000002\` on the HDD, Guitar Hero 5 never asked for this folder, and no DLC loaded. With the folder (one package in it), the merge worked. Cause: XAM lists `Content\<ID>\` and looks for the title ID. Fixed in v13.5 (`Content.TitleFolders`).
 
 **Title updates.** XAM does not list `000B0000`. It opens exact names on each device, for example `tu00000002_00000000` (Guitar Hero II) and `tu00000001_00000000` (Minecraft). Only lowercase `tu…` files work. Uppercase `TU_…` files (system cache) are not supported, and the trace never showed how they load.
 
@@ -109,14 +108,14 @@ Details: section "Findings for later work" in `README.md`.
 
 | File | Content |
 |---|---|
-| `NasDlc/nasdlc.cpp` | Source, version 13.4 (13.2 + prefetch, listing trace and title folder fix, all off by default) |
+| `NasDlc/nasdlc.cpp` | Source, version 13.5 |
 | `NasDlc/NasDlc.xml` | XEX configuration |
 | `NasDlc/NasDlc.ini` | Sample settings |
 | `NasDlc.sln`, `NasDlc/NasDlc.vcxproj` | Visual Studio 2010 project |
 | `README.md` | User documentation and kernel findings |
 | `FOLLOWUP.md` | Next steps, with acceptance criteria |
 
-Older and diagnostic versions are not in the repository. They were: v7 (first working redirect), v8 (read measurement), v9/v9b (cache failure and diagnosis), v10 (cache fix), v11 (title updates), v12 (INI, notifications), v13 (safety fixes), v13.1 (HDD log lines, log file lock), v14a–v14d (kernel probe, SMB read capture, priority boost).
+Older and diagnostic versions are not in the repository. They were: v7 (first working redirect), v8 (read measurement), v9/v9b (cache failure and diagnosis), v10 (cache fix), v11 (title updates), v12 (INI, notifications), v13 (safety fixes), v13.1 (HDD log lines, log file lock), v14a–v14d (kernel probe, SMB read capture, priority boost), v13.3/v13.4 (parallel prefetch: no gain, removed in v13.5).
 
 ## How to read a log
 
