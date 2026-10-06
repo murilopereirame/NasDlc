@@ -16,7 +16,7 @@ Context for Claude Code agents. Read this file and `FOLLOWUP.md` before you chan
 
 NasDlc is a DashLaunch plugin (system DLL, `.xex`) for the Xbox 360. It loads DLC (content type `00000002`) and title updates (`000B0000`) from a NAS share, so that they do not need space on the HDD.
 
-Current release: **version 13.2**. Version 13.3 (in test) adds the parallel prefetch (`Speed.Prefetch`, off by default). Version 13.4 (in test) adds the listing trace (`CT list` lines) (`NasDlc/nasdlc.cpp`). It works with Guitar Hero II (`415607E7`), Guitar Hero 5 (`41560840`) and Minecraft (`584111F7`).
+Current release: **version 13.2**. Version 13.3 (in test) adds the parallel prefetch (`Speed.Prefetch`, off by default). Version 13.4 (in test) adds the listing trace (`CT list` lines) and the title folder fix (`Content.TitleFolders`, off by default) (`NasDlc/nasdlc.cpp`). It works with Guitar Hero II (`415607E7`), Guitar Hero 5 (`41560840`) and Minecraft (`584111F7`).
 
 ## Environment
 
@@ -54,6 +54,7 @@ The plugin patches the **kernel imports of XAM** (import table slot + call stub)
 8. **Log.** Hooks only copy text into a memory buffer. The watch thread writes the file every 0.5 s, under `g_FileLock`.
 9. **Settings.** `UsbX:\NasDlc.ini` (see `README.md`).
 10. **Prefetch (v13.3, `Speed.Prefetch = 0` by default).** When XAM opens a NAS DLC folder, a worker thread lists the same folder with its own handle and queues each package. 1 to 4 worker threads (system threads) open each package read-only and fill `0-1000` of its cache entry. A worker stays max. 8 packages in front of XAM. The hooks only queue a folder; they never wait for a worker, except after a sharing violation on a package that a worker has open (max. 500 ms, then one retry). The queue is cancelled at each title change.
+11. **Title folder fix (v13.4, `Content.TitleFolders = 0` by default).** Level 1: an HDD folder `Content\<ID>\` gets an extra NAS handle. After the last HDD entry, one NAS query with the mask `<current title ID>` (or the 8-hex mask of XAM) adds max. 1 entry. Level 2: `Content\<ID>\<TitleID>\` is merged the same way with the mask `00000002`. If the HDD title folder is missing, XAM gets the NAS title folder, and the listing uses the mask `00000002`. If the HDD listing already has the name, there is no NAS query. Code: `TitleFolderOpen`, `QueryLevel`.
 
 ## Rules that you must not break
 
@@ -80,6 +81,8 @@ These come from real failures. Each one cost a test cycle.
 
 **Folder walk (v13.3 log, ContentTrace).** At a DLC scan, XAM opens `Content\`, then `Content\<ID>\`, then `Content\<ID>\<TitleID>\`, then `...\<TitleID>\00000002\`. It opens the next level only if the folder exists: there is no failed open of a missing title folder. Thus XAM probably lists each level and looks for the next name. Version 13.4 logs the listings to prove this.
 
+**Without the HDD title folder (v13.3 log).** At the Quickplay scan, XAM opens `Content\` and `Content\0000000000000000\`, and then stops. There is no open of `0000000000000000\41560840\`. Thus XAM decides from the content of `Content\0000000000000000\`.
+
 **Title folder problem.** Without `Hdd1\Content\0000000000000000\41560840\00000002\` on the HDD, Guitar Hero 5 never asked for this folder, and no DLC loaded. With the folder (one package in it), the merge worked. XAM probably checks a higher folder first. Workaround: create the empty folder. Fix: see `FOLLOWUP.md`.
 
 **Title updates.** XAM does not list `000B0000`. It opens exact names on each device, for example `tu00000002_00000000` (Guitar Hero II) and `tu00000001_00000000` (Minecraft). Only lowercase `tu…` files work. Uppercase `TU_…` files (system cache) are not supported, and the trace never showed how they load.
@@ -100,7 +103,7 @@ Details: section "Findings for later work" in `README.md`.
 
 | File | Content |
 |---|---|
-| `NasDlc/nasdlc.cpp` | Source, version 13.4 (13.2 + prefetch test feature + listing trace) |
+| `NasDlc/nasdlc.cpp` | Source, version 13.4 (13.2 + prefetch, listing trace and title folder fix, all off by default) |
 | `NasDlc/NasDlc.xml` | XEX configuration |
 | `NasDlc/NasDlc.ini` | Sample settings |
 | `NasDlc.sln`, `NasDlc/NasDlc.vcxproj` | Visual Studio 2010 project |

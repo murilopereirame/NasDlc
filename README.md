@@ -63,6 +63,7 @@ All settings are optional. A missing setting keeps its default value.
 | `[Paths]` | `NasContent` | `\Network\Smb\DOCKER\XBOXSMB\Content\` | NAS content folder: `\Network\Smb\<server>\<share>\Content\` |
 | `[Content]` | `Dlc` | `1` | Load DLC from the NAS. |
 | `[Content]` | `TitleUpdates` | `1` | Load title updates from the NAS. |
+| `[Content]` | `TitleFolders` | `0` | Test feature: find DLC on the NAS also when the title folder is not on the HDD (see Limits). |
 | `[Notify]` | `Start` | `1` | Notifications "active" and "NAS connected". |
 | `[Notify]` | `Found` | `1` | Notifications "N DLC packages found" and "title update loaded". |
 | `[Log]` | `Level` | `1` | `0` = no log, `1` = important lines, `2` = all details. |
@@ -101,7 +102,7 @@ Each NAS request costs one video frame (16.6 ms) while a game runs. XAM reads DL
 - Uppercase `TU_…` title updates are not supported.
 - Content on USB storage devices is not redirected.
 - If the NAS is not connected, the plugin has no effect. The console then uses only the HDD.
-- **The title folder must exist on the HDD.** Some games (for example Guitar Hero 5) search for DLC only if `Hdd1\Content\0000000000000000\<TitleID>\00000002\` exists on the HDD. Create this folder (it can be empty) for each game with DLC on the NAS.
+- **The title folder must exist on the HDD.** Some games (for example Guitar Hero 5) search for DLC only if `Hdd1\Content\0000000000000000\<TitleID>\00000002\` exists on the HDD. Create this folder (it can be empty) for each game with DLC on the NAS. Version 13.4 has a test fix for this problem: `Content.TitleFolders = 1`.
 
 ## Build
 

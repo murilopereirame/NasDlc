@@ -15,6 +15,9 @@
 //                  many small header reads of XAM need few NAS requests.
 //                  Reads without an offset (current position) always go to
 //                  the NAS, because XAM sets that position with a seek.
+//  - Title folders: optional (Content.TitleFolders). NAS title folders and
+//                  type folders are added to the HDD listings of
+//                  Content\<ID>\ and Content\<ID>\<TitleID>\.
 //  - Prefetch:     optional (Speed.Prefetch). Worker threads list each NAS DLC
 //                  folder and fill the cache of each package before XAM
 //                  opens it.
@@ -93,6 +96,7 @@ typedef struct _CONFIG {
     int  logLevel;                   // 0 = off, 1 = important lines, 2 = all details
     BOOL tuTrace;                    // Log title update searches (diagnostic)
     BOOL contentTrace;               // Log all XAM accesses to \Content\ paths (diagnostic)
+    BOOL titleFolders;               // Title folder fix: NAS title and type folders in HDD listings
     BOOL cache;                      // Header cache on/off
     BOOL cacheVerify;                // Diagnostic: compare cache data with NAS data
     BOOL prefetch;                   // Fill the package caches with worker threads
@@ -121,6 +125,7 @@ static void ConfigDefaults()
     g_Cfg.logLevel    = 1;
     g_Cfg.tuTrace     = FALSE;
     g_Cfg.contentTrace = FALSE;
+    g_Cfg.titleFolders = FALSE;
     g_Cfg.cache       = TRUE;
     g_Cfg.cacheVerify = FALSE;
     g_Cfg.prefetch    = FALSE;
@@ -198,6 +203,7 @@ static void LoadConfig()
         else if (!_stricmp(full, "Notify.Found"))        g_Cfg.notifyFound = ParseBool(val, g_Cfg.notifyFound);
         else if (!_stricmp(full, "Log.Level"))           { int v = atoi(val); if (v >= 0 && v <= 2) g_Cfg.logLevel = v; }
         else if (!_stricmp(full, "Log.TuTrace"))         g_Cfg.tuTrace     = ParseBool(val, g_Cfg.tuTrace);
+        else if (!_stricmp(full, "Content.TitleFolders")) g_Cfg.titleFolders = ParseBool(val, g_Cfg.titleFolders);
         else if (!_stricmp(full, "Log.ContentTrace"))    g_Cfg.contentTrace = ParseBool(val, g_Cfg.contentTrace);
         else if (!_stricmp(full, "Cache.Enabled"))       g_Cfg.cache       = ParseBool(val, g_Cfg.cache);
         else if (!_stricmp(full, "Cache.Verify"))        g_Cfg.cacheVerify = ParseBool(val, g_Cfg.cacheVerify);
@@ -447,6 +453,11 @@ typedef struct _DIRSTATE {
     char   nasPath[300]; // NAS folder path (for the list of known NAS files)
     int    nseen;
     char   seen[MAX_SEEN][NAME_LEN];
+    BOOL   nasFirst;   // Title folder fix: next NAS query is the first of this scan
+    BOOL   lvlReady;   // Title folder fix: lvlMask is set for this scan
+    BOOL   hddHas;     // Title folder fix: the HDD listing has the name lvlMask
+    char   xamMask[12]; // Title folder fix: mask of XAM in this scan
+    char   lvlMask[12]; // Title folder fix: mask for the NAS query ("" = no NAS query)
 } DIRSTATE;
 
 static CRITICAL_SECTION g_DirLock;
@@ -460,6 +471,8 @@ static void DirAdd(HANDLE h, HANDLE nas, int phase, int type, const char* nasPat
             g_Dirs[i].h = h; g_Dirs[i].nas = nas; g_Dirs[i].phase = phase;
             g_Dirs[i].type = type; g_Dirs[i].nasCount = 0; g_Dirs[i].nseen = 0;
             g_Dirs[i].nasStart = 0;
+            g_Dirs[i].nasFirst = TRUE; g_Dirs[i].lvlReady = FALSE; g_Dirs[i].hddHas = FALSE;
+            g_Dirs[i].xamMask[0] = 0; g_Dirs[i].lvlMask[0] = 0;
             strncpy(g_Dirs[i].nasPath, nasPath, sizeof(g_Dirs[i].nasPath) - 1);
             g_Dirs[i].nasPath[sizeof(g_Dirs[i].nasPath) - 1] = 0;
             LeaveCriticalSection(&g_DirLock);
@@ -735,6 +748,7 @@ static PFN1  g_pNtClose;
 static PFN8  g_pNtReadFile;
 
 static volatile BOOL g_NasReadOnly;     // TRUE after the first write open was denied
+static volatile DWORD g_CurTitle;       // Current title ID (set by the watch thread)
 
 // ---------------------------------------------------------------------------
 // Parallel prefetch (Speed.Prefetch, off by default)
@@ -1247,6 +1261,229 @@ static void TraceList(U64 h, U64 ev, U64 apc, U64 iosb, U64 info, U64 len,
         path, m, (DWORD)len, (DWORD)a9, async ? " (async)" : "", (DWORD)r, count, names);
 }
 
+// ---------------------------------------------------------------------------
+// Title folder fix (Content.TitleFolders, off by default)
+// ---------------------------------------------------------------------------
+// XAM lists Content\<ID>\ and opens <ID>\<TitleID>\ only if the listing has
+// the title ID. Then it lists <ID>\<TitleID>\ and opens <type>\ only if the
+// listing has the type. Without the HDD title folder, XAM never asks for
+// the DLC folder. Thus:
+//  - Level 1, Content\<ID>\ (HDD folder exists): after the last HDD entry, the
+//    listing continues with the NAS folder <ID>\, with the mask <current
+//    title ID>. Max. 1 entry, 1 NAS request.
+//  - Level 2, Content\<ID>\<TitleID>\: HDD folder exists -> merge as in level
+//    1, with the mask 00000002. HDD folder missing -> XAM gets the NAS
+//    folder, and the listing uses the mask 00000002.
+// If XAM gives a mask of 8 hex characters itself, that mask is used.
+// If the HDD listing has the same name, the NAS query is not done.
+
+#define TYPE_LVL_ID     10           // Content\<ID>\: title folders
+#define TYPE_LVL_TITLE  11           // Content\<ID>\<TitleID>\: type folders
+
+static BOOL IsLevelType(int t) { return t >= TYPE_LVL_ID; }
+
+// "<HddContent><16 hex>[\]" = 1, "<HddContent><16 hex>\<8 hex>[\]" = 2, else 0.
+static int MapLevelToNas(const char* in, char* out, int max)
+{
+    if (!StartsWithI(in, g_Cfg.hddContent)) return 0;
+    const char* r = in + strlen(g_Cfg.hddContent);
+    int level;
+    for (int i = 0; i < 16; i++) if (!IsHex(r[i])) return 0;
+    if (r[16] == 0 || (r[16] == '\\' && r[17] == 0)) {
+        level = 1;
+    } else {
+        if (r[16] != '\\') return 0;
+        for (int i = 17; i < 25; i++) if (!IsHex(r[i])) return 0;
+        if (r[25] == 0 || (r[25] == '\\' && r[26] == 0)) level = 2;
+        else return 0;
+    }
+    int n = _snprintf(out, max, "%s%s", g_Cfg.nasContent, r);
+    if (n < 0 || n >= max) return 0;
+    return level;
+}
+
+static int BuildNasLevel(POBJECT_ATTRIBUTES src, NASPATH* np)
+{
+    if (!src || !MmIsAddressValid(src) || src->RootDirectory) return 0;
+    STRING* s = src->ObjectName;
+    if (!s || !MmIsAddressValid(s) || !s->Buffer || !MmIsAddressValid(s->Buffer)) return 0;
+    char in[300];
+    if (s->Length >= sizeof(in)) return 0;
+    memcpy(in, s->Buffer, s->Length);
+    in[s->Length] = 0;
+    int level = MapLevelToNas(in, np->buf, sizeof(np->buf));
+    if (!level) return 0;
+    RtlInitAnsiString(&np->name, np->buf);
+    np->oa = *src;
+    np->oa.ObjectName = &np->name;
+    np->oa.RootDirectory = NULL;
+    np->type = level == 1 ? TYPE_LVL_ID : TYPE_LVL_TITLE;
+    return level;
+}
+
+// NtOpenFile hook, for paths that MapToNas does not accept.
+static U64 TitleFolderOpen(U64 r, U64 ph, U64 access, U64 oa, U64 iosb, U64 share, U64 opts)
+{
+    if (!g_Cfg.titleFolders || !g_Cfg.dlc) return r;
+    NASPATH np;
+    int level = BuildNasLevel((POBJECT_ATTRIBUTES)PTR(oa), &np);
+    if (!level) return r;
+    size_t bl = strlen(np.buf);
+    BOOL isDir = ((DWORD)opts & FILE_DIRECTORY_FILE) || (bl && np.buf[bl - 1] == '\\');
+    if (!isDir) return r;
+
+    NTSTATUS st = STATUS(r);
+    if (NT_SUCCESS(st)) {
+        // HDD folder exists: open the NAS folder too, for the merge.
+        HANDLE hNas = NULL;
+        IO_STATUS_BLOCK io;
+        U64 r2 = g_pNtOpenFile(RAW(&hNas), access, RAW(&np.oa), RAW(&io), share, opts);
+        if (NT_SUCCESS(STATUS(r2)) && hNas) {
+            DirAdd(*(HANDLE*)PTR(ph), hNas, 0, np.type, np.buf);
+            LogV("title folders: merge level %d %s", level, np.buf);
+        } else {
+            LogV("title folders: merge level %d %s = %08X (no NAS folder)", level, np.buf, (DWORD)r2);
+        }
+        return r;
+    }
+
+    // Level 2, HDD title folder missing: XAM gets the NAS title folder.
+    if (level != 2 || !IsNotFound(st)) return r;
+    U64 r2 = g_pNtOpenFile(ph, access, RAW(&np.oa), iosb, share, opts);
+    Log("title folders: NAS folder %s access %08X = %08X", np.buf, (DWORD)access, (DWORD)r2);
+    if (!NT_SUCCESS(STATUS(r2))) return r;
+    DirAdd(*(HANDLE*)PTR(ph), NULL, 1, np.type, np.buf);
+    return r2;
+}
+
+static BOOL IsHex8(const char* s)
+{
+    for (int i = 0; i < 8; i++) if (!IsHex(s[i])) return FALSE;
+    return s[8] == 0;
+}
+
+// Mask for the first NAS query of a level folder. Empty = no NAS query.
+static void LevelMask(DIRSTATE* d, char* out)
+{
+    out[0] = 0;
+    if (d->type == TYPE_LVL_ID) {
+        if (IsHex8(d->xamMask)) { strcpy(out, d->xamMask); return; }
+        DWORD t = g_CurTitle;
+        if (t && t != 0xFFFFFFFF) sprintf(out, "%08X", t);
+    } else {
+        if (IsHex8(d->xamMask)) {
+            if (!_stricmp(d->xamMask, g_Types[TYPE_DLC])) strcpy(out, d->xamMask);
+            return;
+        }
+        strcpy(out, g_Types[TYPE_DLC]);
+    }
+}
+
+// Look for lvlMask in an HDD result (one or more entries).
+static void CheckHddHas(DIRSTATE* d, U64 info, U64 iosb, U64 len)
+{
+    if (!d->lvlMask[0] || d->hddHas) return;
+    if (!(DWORD)info || !MmIsAddressValid(PTR(info))) return;
+    DWORD used = (DWORD)len;
+    IO_STATUS_BLOCK* io = (IO_STATUS_BLOCK*)PTR(iosb);
+    if (io && MmIsAddressValid(io) && io->Information && io->Information < used)
+        used = (DWORD)io->Information;
+    DWORD pos = 0;
+    while (pos + 0x40 <= used) {
+        BYTE* e    = (BYTE*)PTR(info) + pos;
+        DWORD next = *(DWORD*)(e + 0x00);
+        DWORD n    = *(DWORD*)(e + 0x3C);
+        if (pos + 0x40 + n > used) break;
+        if (n == 8) {
+            char nm[9];
+            memcpy(nm, e + 0x40, 8);
+            nm[8] = 0;
+            if (!_stricmp(nm, d->lvlMask)) { d->hddHas = TRUE; return; }
+        }
+        if (!next) break;
+        pos += next;
+    }
+}
+
+// NtQueryDirectoryFile for a level folder (synchronous calls only).
+static U64 QueryLevel(DIRSTATE* d, U64 h, U64 ev, U64 apc, U64 ctx, U64 iosb,
+                      U64 info, U64 len, U64 mask, U64 a9, U64 a10)
+{
+    if ((DWORD)mask || !d->lvlReady) {                  // New scan (or first call)
+        if (d->nas) d->phase = 0;
+        d->nasFirst = TRUE;
+        d->nasCount = 0;
+        d->hddHas   = FALSE;
+        d->xamMask[0] = 0;
+        STRING* ms = (STRING*)PTR(mask);
+        if (ms && MmIsAddressValid(ms) && ms->Buffer && MmIsAddressValid(ms->Buffer) &&
+            ms->Length < sizeof(d->xamMask)) {
+            memcpy(d->xamMask, ms->Buffer, ms->Length);
+            d->xamMask[ms->Length] = 0;
+        }
+        LevelMask(d, d->lvlMask);
+        d->lvlReady = TRUE;
+    }
+
+    for (int guard = 0; guard < 16; guard++) {
+        if (d->phase == 0) {
+            U64 r = g_pNtQueryDirectoryFile(h, ev, apc, ctx, iosb, info, len, mask, a9, a10);
+            NTSTATUS st = STATUS(r);
+            if (NT_SUCCESS(st)) { CheckHddHas(d, info, iosb, len); return r; }
+            if ((st == ST_NO_MORE_FILES || st == ST_NO_SUCH_FILE) && d->nas) {
+                d->phase = 1;                            // Continue with the NAS folder
+                continue;
+            }
+            return r;
+        }
+
+        // Phase 1: NAS entries (from the extra handle, or from h itself).
+        U64 hq = d->nas ? RAW(d->nas) : h;
+        U64 r;
+        if (d->nasFirst) {
+            d->nasFirst = FALSE;
+            const char* m = d->lvlMask;
+            if (!m[0] || d->hddHas) {
+                if (d->nas) {
+                    IO_STATUS_BLOCK* io = (IO_STATUS_BLOCK*)PTR(iosb);
+                    if (io && MmIsAddressValid(io)) { IOSB_STATUS(io) = ST_NO_MORE_FILES; io->Information = 0; }
+                    return (U64)(DWORD)ST_NO_MORE_FILES;
+                }
+                r = g_pNtQueryDirectoryFile(hq, ev, apc, ctx, iosb, info, len, mask, a9, a10);
+            } else {
+                STRING ms;
+                RtlInitAnsiString(&ms, m);
+                r = g_pNtQueryDirectoryFile(hq, ev, apc, ctx, iosb, info, len, RAW(&ms), a9, a10);
+                LogV("title folders: NAS query '%s' in %s = %08X", m, d->nasPath, (DWORD)r);
+            }
+        } else {
+            r = g_pNtQueryDirectoryFile(hq, ev, apc, ctx, iosb, info, len, 0, a9, a10);
+        }
+
+        NTSTATUS st = STATUS(r);
+        if (!NT_SUCCESS(st)) {
+            // Merge: "no such file" from the NAS means the end of the listing.
+            if (d->nas && st == ST_NO_SUCH_FILE) {
+                IO_STATUS_BLOCK* io = (IO_STATUS_BLOCK*)PTR(iosb);
+                if (io && MmIsAddressValid(io)) IOSB_STATUS(io) = ST_NO_MORE_FILES;
+                r = (U64)(DWORD)ST_NO_MORE_FILES;
+            }
+            if (d->nasCount)
+                Log("title folders: %d NAS entries added to %s", d->nasCount, d->nasPath);
+            d->nasCount = 0;
+            return r;
+        }
+        char name[NAME_LEN];
+        if (SingleEntryName(PTR(info), name)) {
+            if (IsJunk(name)) continue;
+            LogV("title folders: NAS entry %s", name);
+        }
+        d->nasCount++;
+        return r;
+    }
+    return (U64)(DWORD)ST_NO_MORE_FILES;
+}
+
 // NtOpenFile(ph, access, oa, iosb, share, options)
 static U64 Hook_NtOpenFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 share, U64 opts)
 {
@@ -1256,7 +1493,8 @@ static U64 Hook_NtOpenFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 share, U64 
     TraceDirOpen(ph, oa, opts, r);
 
     NASPATH np;
-    if (!BuildNas((POBJECT_ATTRIBUTES)PTR(oa), &np)) return r;
+    if (!BuildNas((POBJECT_ATTRIBUTES)PTR(oa), &np))
+        return TitleFolderOpen(r, ph, access, oa, iosb, share, opts);
     BOOL isDir = ((DWORD)opts & FILE_DIRECTORY_FILE) != 0;
     NTSTATUS st = STATUS(r);
     LogV("HDD %s %s = %08X", isDir ? "folder" : "open",
@@ -1385,6 +1623,8 @@ static U64 QueryDirectory(U64 h, U64 ev, U64 apc, U64 ctx, U64 iosb,
     DIRSTATE* d = DirFind((HANDLE)PTR(h));
     if (!d || (DWORD)ev || (DWORD)apc)                  // Not ours, or asynchronous
         return g_pNtQueryDirectoryFile(h, ev, apc, ctx, iosb, info, len, mask, a9, a10);
+    if (IsLevelType(d->type))
+        return QueryLevel(d, h, ev, apc, ctx, iosb, info, len, mask, a9, a10);
 
     // A mask means a new scan: start again (merge: with the HDD entries).
     if ((DWORD)mask) {
@@ -1764,6 +2004,7 @@ static DWORD WINAPI WatchThread(LPVOID)
         DWORD tid = XamGetCurrentTitleId();
         if (tid != lastTitle) {
             lastTitle = tid;
+            g_CurTitle = tid;
             Log("Title changed: %08X", tid);
             PrefetchReset();
             CacheTrim(TRUE);
@@ -1835,9 +2076,9 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD reason, LPVOID reserved)
         Log("Speed.Prefetch needs Cache.Enabled = 1: prefetch off");
         g_Cfg.prefetch = FALSE;
     }
-    Log("DLC %d, title updates %d, notify start %d / found %d, log %d, TU trace %d, content trace %d, cache %d, verify %d, prefetch %d (%d threads)",
+    Log("DLC %d, title updates %d, notify start %d / found %d, log %d, TU trace %d, content trace %d, title folders %d, cache %d, verify %d, prefetch %d (%d threads)",
         g_Cfg.dlc, g_Cfg.tu, g_Cfg.notifyStart, g_Cfg.notifyFound,
-        g_Cfg.logLevel, g_Cfg.tuTrace, g_Cfg.contentTrace, g_Cfg.cache, g_Cfg.cacheVerify,
+        g_Cfg.logLevel, g_Cfg.tuTrace, g_Cfg.contentTrace, g_Cfg.titleFolders, g_Cfg.cache, g_Cfg.cacheVerify,
         g_Cfg.prefetch, g_Cfg.pfThreads);
 
     if (!CacheExports()) {

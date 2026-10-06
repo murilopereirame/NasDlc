@@ -22,7 +22,17 @@ Result of the first trace (v13.3, with the HDD folder): XAM opens `Content\`, `C
    - an open or listing of `…\Content\0000000000000000\` (user folder), followed by a check for the title ID,
    - an attribute query (`NtQueryFullAttributesFile`) of the title folder.
 
-**Step 1b: fix (depends on 1a).**
+Result of the second trace (v13.3, without the HDD folder): at the Quickplay scan, XAM opens `Content\` and `Content\0000000000000000\`, and then stops. It never opens `0000000000000000\41560840\`. Thus XAM decides from the content of `Content\0000000000000000\`. Unknown: mask and entries per call. The v13.4 trace shows them.
+
+**Step 1b: fix — implemented in v13.4 (`Content.TitleFolders`, off by default), not tested.** Design: see CLAUDE.md, architecture item 11. The fix does not depend on the mask or on the number of entries per call: the NAS query uses its own mask (the current title ID, or `00000002`), so it returns max. 1 entry.
+
+**Test (one build, two boots), HDD folder `Content\0000000000000000\41560840` moved away:**
+
+1. Boot 1: `TitleFolders = 0`, `ContentTrace = 1`, `Level = 2`. Open the Quickplay song list. Keep the log (`CT list` lines = the trace for step 1a).
+2. Boot 2: `TitleFolders = 1`, same other settings. Open the Quickplay song list. Look for `title folders:` lines and `NAS listing done: 63 DLC entries`.
+3. Boot 3 (regression): put the HDD folder back, `TitleFolders = 1`. Guitar Hero 5 must still show all songs.
+
+**Original plan for step 1b (for reference).**
 
 - If XAM opens or queries the **title folder**: extend `MapToNas` to accept `<16 hex>\<8 hex>` (no type) and `<16 hex>\<8 hex>\` for **folder opens and attribute queries only**. On HDD "not found", return the NAS result. Register no merge for this level.
 - If XAM **lists** `Content\<ID>\`: merge the listing like the DLC listing (HDD title folders first, then NAS title folders, without duplicates). Only title ID names (8 hex) from the NAS.
