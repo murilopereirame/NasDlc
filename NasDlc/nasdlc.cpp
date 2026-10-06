@@ -1,14 +1,4 @@
-// NasDlc.cpp
-// Phase 1: DashLaunch plugin that ONLY LOGS.
-// It patches the XAM imports of one game and logs every content call.
-// The game operates normally. No DLC is redirected yet.
-//
-// Build: Xbox 360 Project, type "Shared library" (DLL), with xkelib.
-// Install: copy to Hdd:\NasDlc.xex and add "pluginN = Hdd:\NasDlc.xex" to launch.ini.
-// Log: Hdd:\NasDlc.log
-
-#include "stdafx.h"
-// NasDlc.cpp  (version 13)
+// NasDlc.cpp  (version 13.2)
 // DashLaunch plugin: load DLC (00000002) and title updates (000B0000) from the NAS.
 //
 // How it works: the plugin patches the kernel file imports of XAM.
@@ -43,7 +33,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define PLUGIN_NAME   "NasDlc v13"
+#define PLUGIN_NAME   "NasDlc v13.2"
 
 // ---------------------------------------------------------------------------
 // Fixed values
@@ -99,6 +89,7 @@ typedef struct _CONFIG {
     BOOL notifyFound;                // Notify: DLC or title update from the NAS
     int  logLevel;                   // 0 = off, 1 = important lines, 2 = all details
     BOOL tuTrace;                    // Log title update searches (diagnostic)
+    BOOL contentTrace;               // Log all XAM accesses to \Content\ paths (diagnostic)
     BOOL cache;                      // Header cache on/off
     BOOL cacheVerify;                // Diagnostic: compare cache data with NAS data
 } CONFIG;
@@ -124,6 +115,7 @@ static void ConfigDefaults()
     g_Cfg.notifyFound = TRUE;
     g_Cfg.logLevel    = 1;
     g_Cfg.tuTrace     = FALSE;
+    g_Cfg.contentTrace = FALSE;
     g_Cfg.cache       = TRUE;
     g_Cfg.cacheVerify = FALSE;
 }
@@ -199,6 +191,7 @@ static void LoadConfig()
         else if (!_stricmp(full, "Notify.Found"))        g_Cfg.notifyFound = ParseBool(val, g_Cfg.notifyFound);
         else if (!_stricmp(full, "Log.Level"))           { int v = atoi(val); if (v >= 0 && v <= 2) g_Cfg.logLevel = v; }
         else if (!_stricmp(full, "Log.TuTrace"))         g_Cfg.tuTrace     = ParseBool(val, g_Cfg.tuTrace);
+        else if (!_stricmp(full, "Log.ContentTrace"))    g_Cfg.contentTrace = ParseBool(val, g_Cfg.contentTrace);
         else if (!_stricmp(full, "Cache.Enabled"))       g_Cfg.cache       = ParseBool(val, g_Cfg.cache);
         else if (!_stricmp(full, "Cache.Verify"))        g_Cfg.cacheVerify = ParseBool(val, g_Cfg.cacheVerify);
         else g_IniUnknown++;
@@ -212,6 +205,7 @@ static void LoadConfig()
 #define LOG_BUF_SIZE 0x8000
 
 static CRITICAL_SECTION g_LogLock;
+static CRITICAL_SECTION g_FileLock;     // Only one writer of the log file at a time
 static DWORD            g_StartTick;
 static LONG             g_MountStatus;
 static char             g_LogBuf[LOG_BUF_SIZE];
@@ -252,17 +246,18 @@ static void Log(const char* fmt, ...)
 
 static void FlushLog()
 {
+    EnterCriticalSection(&g_FileLock);
     DWORD len, dropped;
     EnterCriticalSection(&g_LogLock);
     len = g_LogLen; dropped = g_LogDropped;
     if (len) memcpy(g_LogOut, g_LogBuf, len);
     g_LogLen = 0; g_LogDropped = 0;
     LeaveCriticalSection(&g_LogLock);
-    if (!len && !dropped) return;
+    if (!len && !dropped) { LeaveCriticalSection(&g_FileLock); return; }
 
     HANDLE h = CreateFile(LOG_PATH, GENERIC_WRITE, FILE_SHARE_READ, NULL,
                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == INVALID_HANDLE_VALUE) { LeaveCriticalSection(&g_FileLock); return; }
     SetFilePointer(h, 0, NULL, FILE_END);
     DWORD written;
     if (len) WriteFile(h, g_LogOut, len, &written, NULL);
@@ -272,6 +267,7 @@ static void FlushLog()
         WriteFile(h, msg, (DWORD)strlen(msg), &written, NULL);
     }
     CloseHandle(h);
+    LeaveCriticalSection(&g_FileLock);
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +370,22 @@ static void TraceTu(const char* op, U64 oaRaw, U64 access, U64 r)
         return;
     Log("TU %s %s%s access %08X = %08X", op,
         oa->RootDirectory ? "(relative to handle) " : "", p, (DWORD)access, (DWORD)r);
+}
+
+// Diagnostic: log each XAM access to a path that contains "\Content\", on all devices.
+static void TraceContent(const char* op, U64 oaRaw, U64 r)
+{
+    if (!g_Cfg.contentTrace) return;
+    POBJECT_ATTRIBUTES oa = (POBJECT_ATTRIBUTES)PTR(oaRaw);
+    if (!oa || !MmIsAddressValid(oa)) return;
+    STRING* s = oa->ObjectName;
+    if (!s || !MmIsAddressValid(s) || !s->Buffer || !MmIsAddressValid(s->Buffer)) return;
+    char p[300];
+    DWORD n = s->Length < sizeof(p) - 1 ? s->Length : sizeof(p) - 1;
+    memcpy(p, s->Buffer, n);
+    p[n] = 0;
+    if (!ContainsI(p, "\\Content\\")) return;
+    Log("CT %s %s%s = %08X", op, oa->RootDirectory ? "(relative) " : "", p, (DWORD)r);
 }
 
 typedef struct _NASPATH {
@@ -706,11 +718,14 @@ static U64 Hook_NtOpenFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 share, U64 
 {
     U64 r = g_pNtOpenFile(ph, access, oa, iosb, share, opts);
     TraceTu("open", oa, access, r);
+    TraceContent("open", oa, r);
 
     NASPATH np;
     if (!BuildNas((POBJECT_ATTRIBUTES)PTR(oa), &np)) return r;
     BOOL isDir = ((DWORD)opts & FILE_DIRECTORY_FILE) != 0;
     NTSTATUS st = STATUS(r);
+    LogV("HDD %s %s = %08X", isDir ? "folder" : "open",
+         np.buf + strlen(g_Cfg.nasContent), (DWORD)st);
 
     if (NT_SUCCESS(st)) {
         if (!isDir) return r;                           // File is on the HDD
@@ -721,6 +736,8 @@ static U64 Hook_NtOpenFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 share, U64 
         if (NT_SUCCESS(STATUS(r2)) && hNas) {
             DirAdd(*(HANDLE*)PTR(ph), hNas, 0, np.type, np.buf);
             LogV("merge folder %s", np.buf);
+        } else {
+            LogV("merge folder %s = %08X (no NAS folder)", np.buf, (DWORD)r2);
         }
         return r;
     }
@@ -770,6 +787,7 @@ static U64 Hook_NtCreateFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 alloc,
 {
     U64 r = g_pNtCreateFile(ph, access, oa, iosb, alloc, attr, share, disp, opts);
     TraceTu("create", oa, access, r);
+    TraceContent("create", oa, r);
     if (!IsNotFound(STATUS(r))) return r;
     // Redirect only the open of an existing file (FILE_OPEN = 1).
     // The creation of new files and folders always stays on the HDD.
@@ -800,6 +818,7 @@ static U64 Hook_NtQueryFullAttributesFile(U64 oa, U64 info)
 {
     U64 r = g_pNtQueryFullAttributesFile(oa, info);
     TraceTu("attributes", oa, 0, r);
+    TraceContent("attributes", oa, r);
     if (!IsNotFound(STATUS(r))) return r;
 
     NASPATH np;
@@ -1239,6 +1258,7 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD reason, LPVOID reserved)
 
     g_StartTick = GetTickCount();
     InitializeCriticalSection(&g_LogLock);
+    InitializeCriticalSection(&g_FileLock);
     InitializeCriticalSection(&g_DirLock);
     InitializeCriticalSection(&g_EventLock);
     MountUsbDrive();
@@ -1248,9 +1268,9 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD reason, LPVOID reserved)
     if (g_IniState < 0) Log("No NasDlc.ini found: default settings");
     else                Log("NasDlc.ini read: %d settings, %d unknown", g_IniKeys, g_IniUnknown);
     Log("HDD %s -> NAS %s", g_Cfg.hddContent, g_Cfg.nasContent);
-    Log("DLC %d, title updates %d, notify start %d / found %d, log %d, TU trace %d, cache %d, verify %d",
+    Log("DLC %d, title updates %d, notify start %d / found %d, log %d, TU trace %d, content trace %d, cache %d, verify %d",
         g_Cfg.dlc, g_Cfg.tu, g_Cfg.notifyStart, g_Cfg.notifyFound,
-        g_Cfg.logLevel, g_Cfg.tuTrace, g_Cfg.cache, g_Cfg.cacheVerify);
+        g_Cfg.logLevel, g_Cfg.tuTrace, g_Cfg.contentTrace, g_Cfg.cache, g_Cfg.cacheVerify);
 
     if (!CacheExports()) {
         Log("Cannot read exports. Plugin inactive.");
