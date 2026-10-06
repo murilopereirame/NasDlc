@@ -31,6 +31,7 @@
 // Build: Title (.xex) + /DLL /ENTRY:"_DllMainCRTStartup" /ALIGN:128,4096
 //        + NasDlc.xml (sysdll, base 0x91E00000).
 
+#include "stdafx.h"
 #include <xtl.h>
 #include <xkelib.h>          // TODO: use the exact main header name of your xkelib
 #include <ppcintrinsics.h>   // __mftb (time base, 50 MHz)
