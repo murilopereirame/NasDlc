@@ -24,7 +24,13 @@ Result of the first trace (v13.3, with the HDD folder): XAM opens `Content\`, `C
 
 Result of the second trace (v13.3, without the HDD folder): at the Quickplay scan, XAM opens `Content\` and `Content\0000000000000000\`, and then stops. It never opens `0000000000000000\41560840\`. Thus XAM decides from the content of `Content\0000000000000000\`. Unknown: mask and entries per call. The v13.4 trace shows them.
 
-**Step 1b: fix — implemented in v13.4 (`Content.TitleFolders`, off by default), not tested.** Design: see CLAUDE.md, architecture item 11. The fix does not depend on the mask or on the number of entries per call: the NAS query uses its own mask (the current title ID, or `00000002`), so it returns max. 1 entry.
+**Result of the v13.4 trace (boot 1).** XAM lists each level with the mask `'*'` on the first call and `NULL` after it. It gets one entry per call (buffer length `0x78`). Then it opens `<ID>\<TitleID>\` only for the title IDs in the listing. This is true for the HDD and the USB device.
+
+**Result of the v13.4 fix (boot 2, `TitleFolders = 1`, HDD folder removed): it works.** The log shows `title folders: NAS entry 41560840`, then `NAS entry 00000002`, then `NAS listing done: 63 DLC entries`. The songs show and play. Cost: one failed NAS open (16 to 33 ms) for each other profile folder (`E000…`) per scan.
+
+**Open:** boot 3 (regression: HDD folder back, Guitar Hero II). Then decide if `TitleFolders = 1` becomes the default.
+
+**Step 1b: fix — implemented in v13.4 (`Content.TitleFolders`, off by default), tested (see above).** Design: see CLAUDE.md, architecture item 11. The fix does not depend on the mask or on the number of entries per call: the NAS query uses its own mask (the current title ID, or `00000002`), so it returns max. 1 entry.
 
 **Test (one build, two boots), HDD folder `Content\0000000000000000\41560840` moved away:**
 
@@ -47,7 +53,15 @@ Result of the second trace (v13.3, without the HDD folder): at the Quickplay sca
 
 ## 2. Parallel prefetch (medium priority)
 
-**Status: implemented in v13.3, not tested on the console.** Each test step below needs a log.
+**Status: tested in v13.4 (4 threads). Result: no gain.** Keep it off. Proposal: remove the code from the next release.
+
+**Test result (Guitar Hero 5, 63 packages).**
+
+- First listing: 23.9 s with prefetch, 23.4 s without. Second listing: 11.9 s with and without.
+- XAM used 62 of the 63 prefetched entries, but it still needs 2 opens and 1 listing query per package, and it waits for frames.
+- Each worker request took 33 to 200 ms (average open 89 ms, average read 127 ms). Worker requests are **not** faster than XAM requests.
+- The worker requests complete exactly one frame apart, also when 4 run in parallel. Thus the SMB path completes about **one request per frame for the whole system**. Parallel requests do not increase the throughput.
+- During the prefetch, XAM's own opens took longer (up to 166 ms instead of 16 to 33 ms).
 
 **Expected gain (from the v13.3 log): small.** Per package, XAM uses about 12 frames, but only 4 are NAS requests. The prefetch removes only the cache fill (1 frame). Expected: about 11.9 s → 10.9 s for 63 packages. The target of 8 s is not possible this way. Priority: low. Do step 1 first.
 

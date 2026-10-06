@@ -83,6 +83,12 @@ These come from real failures. Each one cost a test cycle.
 
 **Without the HDD title folder (v13.3 log).** At the Quickplay scan, XAM opens `Content\` and `Content\0000000000000000\`, and then stops. There is no open of `0000000000000000\41560840\`. Thus XAM decides from the content of `Content\0000000000000000\`.
 
+**Listing format (v13.4 trace).** XAM lists each `\Content\` level with the mask `'*'` on the first call and `NULL` after it, one entry per call, buffer length `0x78`. It opens `<ID>\<TitleID>\` only for the title IDs in the listing.
+
+**Title folder fix works (v13.4, `Content.TitleFolders = 1`).** Without the HDD folder `0000000000000000\41560840`, Guitar Hero 5 loaded all 63 NAS DLC packages, and the songs played.
+
+**Prefetch has no gain (v13.4, 4 threads).** Worker requests take 33 to 200 ms each. They complete one frame apart, also when 4 run in parallel: the SMB path completes about one request per frame for the whole system. Listing time: 23.9 s with prefetch, 23.4 s without (first listing); 11.9 s both (second listing). Parallel requests do not help.
+
 **Title folder problem.** Without `Hdd1\Content\0000000000000000\41560840\00000002\` on the HDD, Guitar Hero 5 never asked for this folder, and no DLC loaded. With the folder (one package in it), the merge worked. XAM probably checks a higher folder first. Workaround: create the empty folder. Fix: see `FOLLOWUP.md`.
 
 **Title updates.** XAM does not list `000B0000`. It opens exact names on each device, for example `tu00000002_00000000` (Guitar Hero II) and `tu00000001_00000000` (Minecraft). Only lowercase `tu…` files work. Uppercase `TU_…` files (system cache) are not supported, and the trace never showed how they load.
