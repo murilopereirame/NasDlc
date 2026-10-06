@@ -1,4 +1,4 @@
-// NasDlc.cpp  (version 13.3)
+// NasDlc.cpp  (version 13.4)
 // DashLaunch plugin: load DLC (00000002) and title updates (000B0000) from the NAS.
 //
 // How it works: the plugin patches the kernel file imports of XAM.
@@ -36,7 +36,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define PLUGIN_NAME   "NasDlc v13.3"
+#define PLUGIN_NAME   "NasDlc v13.4"
 
 // ---------------------------------------------------------------------------
 // Fixed values
@@ -1143,12 +1143,117 @@ static void PrefetchStart()
 // Hooks
 // ---------------------------------------------------------------------------
 
+// Diagnostic (Log.ContentTrace): log each listing of a \Content\ folder.
+// The open hooks keep the handle of each \Content\ folder that XAM opens.
+// After each NtQueryDirectoryFile on such a handle, one "CT list" line shows
+// the mask, the buffer length, the status and the names that XAM got.
+#define CT_DIRS      16
+#define CT_NAMES_MAX 220            // Characters of names in one log line
+
+static HANDLE g_CtDir[CT_DIRS];
+static char   g_CtPath[CT_DIRS][300];
+
+static void TraceDirOpen(U64 ph, U64 oaRaw, U64 opts, U64 r)
+{
+    if (!g_Cfg.contentTrace || !NT_SUCCESS(STATUS(r))) return;
+    HANDLE* pph = (HANDLE*)PTR(ph);
+    if (!pph || !MmIsAddressValid(pph) || !*pph) return;
+    POBJECT_ATTRIBUTES oa = (POBJECT_ATTRIBUTES)PTR(oaRaw);
+    if (!oa || !MmIsAddressValid(oa)) return;
+    STRING* s = oa->ObjectName;
+    if (!s || !MmIsAddressValid(s) || !s->Buffer || !MmIsAddressValid(s->Buffer)) return;
+    char p[300];
+    DWORD n = s->Length < sizeof(p) - 1 ? s->Length : sizeof(p) - 1;
+    memcpy(p, s->Buffer, n);
+    p[n] = 0;
+    if (!ContainsI(p, "\\Content\\")) return;
+    if (!((DWORD)opts & FILE_DIRECTORY_FILE) && (n == 0 || p[n - 1] != '\\')) return;
+    EnterCriticalSection(&g_DirLock);
+    for (int i = 0; i < CT_DIRS; i++) {
+        if (!g_CtDir[i]) { g_CtDir[i] = *pph; strcpy(g_CtPath[i], p); break; }
+    }
+    LeaveCriticalSection(&g_DirLock);
+}
+
+static void TraceDirClose(HANDLE h)
+{
+    if (!g_Cfg.contentTrace || !h) return;
+    EnterCriticalSection(&g_DirLock);
+    for (int i = 0; i < CT_DIRS; i++) if (g_CtDir[i] == h) g_CtDir[i] = NULL;
+    LeaveCriticalSection(&g_DirLock);
+}
+
+static void TraceList(U64 h, U64 ev, U64 apc, U64 iosb, U64 info, U64 len,
+                      U64 mask, U64 a9, U64 r)
+{
+    char path[300];
+    BOOL found = FALSE;
+    EnterCriticalSection(&g_DirLock);
+    for (int i = 0; i < CT_DIRS; i++) {
+        if (g_CtDir[i] && g_CtDir[i] == (HANDLE)PTR(h)) { strcpy(path, g_CtPath[i]); found = TRUE; break; }
+    }
+    LeaveCriticalSection(&g_DirLock);
+    if (!found) return;
+
+    // Mask (ANSI STRING, NULL on a continuation).
+    char   m[48] = "NULL";
+    STRING* ms = (STRING*)PTR(mask);
+    if (ms && MmIsAddressValid(ms)) {
+        if (ms->Buffer && MmIsAddressValid(ms->Buffer)) {
+            DWORD n = ms->Length < sizeof(m) - 3 ? ms->Length : sizeof(m) - 3;
+            m[0] = '\'';
+            memcpy(m + 1, ms->Buffer, n);
+            m[n + 1] = '\'';
+            m[n + 2] = 0;
+        } else {
+            strcpy(m, "(no buffer)");
+        }
+    }
+
+    // Entries: FILE_DIRECTORY_INFORMATION, NextEntryOffset at 0x00,
+    // FileAttributes at 0x38, FileNameLength at 0x3C, FileName at 0x40.
+    char  names[CT_NAMES_MAX + 8];
+    int   count = 0;
+    DWORD nl    = 0;
+    names[0] = 0;
+    BOOL async = (DWORD)ev || (DWORD)apc;
+    if (!async && NT_SUCCESS(STATUS(r)) && (DWORD)info && MmIsAddressValid(PTR(info))) {
+        DWORD used = (DWORD)len;
+        IO_STATUS_BLOCK* io = (IO_STATUS_BLOCK*)PTR(iosb);
+        if (io && MmIsAddressValid(io) && io->Information && io->Information < used)
+            used = (DWORD)io->Information;
+        DWORD pos = 0;
+        while (pos + 0x40 <= used && count < 1000) {
+            BYTE* e    = (BYTE*)PTR(info) + pos;
+            DWORD next = *(DWORD*)(e + 0x00);
+            DWORD attr = *(DWORD*)(e + 0x38);
+            DWORD n    = *(DWORD*)(e + 0x3C);
+            if (pos + 0x40 + n > used) break;
+            count++;
+            if (nl + n + 3 < CT_NAMES_MAX) {
+                if (nl) { names[nl++] = ','; names[nl++] = ' '; }
+                memcpy(names + nl, e + 0x40, n);
+                nl += n;
+                if (attr & FILE_ATTRIBUTE_DIRECTORY) names[nl++] = '\\';
+                names[nl] = 0;
+            } else if (nl && names[nl - 1] != '.') {
+                strcpy(names + nl, " ..."); nl += 4;
+            }
+            if (!next) break;
+            pos += next;
+        }
+    }
+    Log("CT list %s mask %s len %X arg9 %X%s = %08X, %d entries: %s",
+        path, m, (DWORD)len, (DWORD)a9, async ? " (async)" : "", (DWORD)r, count, names);
+}
+
 // NtOpenFile(ph, access, oa, iosb, share, options)
 static U64 Hook_NtOpenFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 share, U64 opts)
 {
     U64 r = g_pNtOpenFile(ph, access, oa, iosb, share, opts);
     TraceTu("open", oa, access, r);
     TraceContent("open", oa, r);
+    TraceDirOpen(ph, oa, opts, r);
 
     NASPATH np;
     if (!BuildNas((POBJECT_ATTRIBUTES)PTR(oa), &np)) return r;
@@ -1225,6 +1330,7 @@ static U64 Hook_NtCreateFile(U64 ph, U64 access, U64 oa, U64 iosb, U64 alloc,
     U64 r = g_pNtCreateFile(ph, access, oa, iosb, alloc, attr, share, disp, opts);
     TraceTu("create", oa, access, r);
     TraceContent("create", oa, r);
+    TraceDirOpen(ph, oa, opts, r);
     if (!IsNotFound(STATUS(r))) return r;
     // Redirect only the open of an existing file (FILE_OPEN = 1).
     // The creation of new files and folders always stays on the HDD.
@@ -1273,7 +1379,7 @@ static U64 Hook_NtQueryFullAttributesFile(U64 oa, U64 info)
 }
 
 // NtQueryDirectoryFile: 10 raw values. Value 8 = file name mask (NULL on continuation).
-static U64 Hook_NtQueryDirectoryFile(U64 h, U64 ev, U64 apc, U64 ctx, U64 iosb,
+static U64 QueryDirectory(U64 h, U64 ev, U64 apc, U64 ctx, U64 iosb,
                                      U64 info, U64 len, U64 mask, U64 a9, U64 a10)
 {
     DIRSTATE* d = DirFind((HANDLE)PTR(h));
@@ -1323,6 +1429,14 @@ static U64 Hook_NtQueryDirectoryFile(U64 h, U64 ev, U64 apc, U64 ctx, U64 iosb,
         return r;
     }
     return (U64)(DWORD)ST_NO_MORE_FILES;
+}
+
+static U64 Hook_NtQueryDirectoryFile(U64 h, U64 ev, U64 apc, U64 ctx, U64 iosb,
+                                     U64 info, U64 len, U64 mask, U64 a9, U64 a10)
+{
+    U64 r = QueryDirectory(h, ev, apc, ctx, iosb, info, len, mask, a9, a10);
+    if (g_Cfg.contentTrace) TraceList(h, ev, apc, iosb, info, len, mask, a9, r);
+    return r;
 }
 
 // Serve a read from the cache. Fills the cache from the NAS when necessary.
@@ -1487,6 +1601,7 @@ static U64 Hook_NtReadFile(U64 h, U64 ev, U64 apc, U64 ctx, U64 iosb,
 // NtClose(h)
 static U64 Hook_NtClose(U64 h)
 {
+    TraceDirClose((HANDLE)PTR(h));
     HANDLE nas = DirRemove((HANDLE)PTR(h));
     if (nas) g_pNtClose(RAW(nas));
     FileClose((HANDLE)PTR(h));

@@ -6,7 +6,13 @@ Status: version 13.2 is the release. DLC and lowercase title updates load from t
 
 **Problem.** Guitar Hero 5 (`41560840`) searches for DLC only if `Hdd1\Content\0000000000000000\41560840\00000002\` exists on the HDD. Without it, XAM never opens that path, so the plugin cannot redirect it. Workaround now: the user creates the empty folder.
 
-**Step 1a: trace (no code change).**
+**Step 1a: trace.**
+
+Result of the first trace (v13.3, with the HDD folder): XAM opens `Content\`, `Content\<ID>\`, `Content\<ID>\<TitleID>\` and `...\<TitleID>\00000002\`, but only folders that exist. There is no failed open of a missing title folder. Thus XAM probably lists `Content\<ID>\` and looks for the title ID. The open trace cannot show listings. Version 13.4 adds `CT list` lines (folder, mask, buffer length, status, names). Do the steps below with v13.4. The log must answer:
+
+- Does XAM list `Content\0000000000000000\` (and `Content\0000000000000000\41560840\`)?
+- Which mask does XAM use (`NULL`, `'*'`, or the title ID)?
+- How many entries does XAM get per call? (The current merge works only with one entry per call.)
 
 1. On the HDD, move the folder `Content\0000000000000000\41560840` to a backup location.
 2. In `NasDlc.ini`: `[Log] Level = 2` and `ContentTrace = 1`.
@@ -32,6 +38,8 @@ Status: version 13.2 is the release. DLC and lowercase title updates load from t
 ## 2. Parallel prefetch (medium priority)
 
 **Status: implemented in v13.3, not tested on the console.** Each test step below needs a log.
+
+**Expected gain (from the v13.3 log): small.** Per package, XAM uses about 12 frames, but only 4 are NAS requests. The prefetch removes only the cache fill (1 frame). Expected: about 11.9 s → 10.9 s for 63 packages. The target of 8 s is not possible this way. Priority: low. Do step 1 first.
 
 **Test plan.**
 

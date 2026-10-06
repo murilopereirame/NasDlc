@@ -16,7 +16,7 @@ Context for Claude Code agents. Read this file and `FOLLOWUP.md` before you chan
 
 NasDlc is a DashLaunch plugin (system DLL, `.xex`) for the Xbox 360. It loads DLC (content type `00000002`) and title updates (`000B0000`) from a NAS share, so that they do not need space on the HDD.
 
-Current release: **version 13.2**. Version 13.3 (in test) adds the parallel prefetch (`Speed.Prefetch`, off by default) (`NasDlc/nasdlc.cpp`). It works with Guitar Hero II (`415607E7`), Guitar Hero 5 (`41560840`) and Minecraft (`584111F7`).
+Current release: **version 13.2**. Version 13.3 (in test) adds the parallel prefetch (`Speed.Prefetch`, off by default). Version 13.4 (in test) adds the listing trace (`CT list` lines) (`NasDlc/nasdlc.cpp`). It works with Guitar Hero II (`415607E7`), Guitar Hero 5 (`41560840`) and Minecraft (`584111F7`).
 
 ## Environment
 
@@ -76,6 +76,10 @@ These come from real failures. Each one cost a test cycle.
 
 **The 16.6 ms delay.** Each NAS request from a XAM thread costs one frame (16.6 ms), also for 4 bytes. Large reads cost about one frame per 8 KB. The same reads from a **game thread** take about 0.6 ms (64 KB in about 7 ms). Without a running game (title update load at launch), all requests are fast. A higher thread priority does **not** help (v14d: 28.14 s vs 28.02 s). The cause is probably in the SMB filter driver.
 
+**Listing time per package (v13.3 log, Guitar Hero 5, 63 packages, cache on, prefetch off).** First listing after the game start: 23.4 s (requests take 33 to 66 ms). Second listing: 11.9 s, about 190 ms = 12 frames per package. Per package, XAM does: listing query (NAS), open read/write (refused at once, no network), open read-only (NAS), 3 reads (`0-354`, cache fill = 1 NAS read), close, open again (NAS), 3 reads (up to `511`, all from the cache), close. Only 4 of the 12 frames are NAS requests. The other frames are XAM waits, also for reads from the cache. Thus the prefetch can save max. about 1 frame per package (about 1 s of 12 s). The target of 8 s is not possible with the cache or the prefetch alone.
+
+**Folder walk (v13.3 log, ContentTrace).** At a DLC scan, XAM opens `Content\`, then `Content\<ID>\`, then `Content\<ID>\<TitleID>\`, then `...\<TitleID>\00000002\`. It opens the next level only if the folder exists: there is no failed open of a missing title folder. Thus XAM probably lists each level and looks for the next name. Version 13.4 logs the listings to prove this.
+
 **Title folder problem.** Without `Hdd1\Content\0000000000000000\41560840\00000002\` on the HDD, Guitar Hero 5 never asked for this folder, and no DLC loaded. With the folder (one package in it), the merge worked. XAM probably checks a higher folder first. Workaround: create the empty folder. Fix: see `FOLLOWUP.md`.
 
 **Title updates.** XAM does not list `000B0000`. It opens exact names on each device, for example `tu00000002_00000000` (Guitar Hero II) and `tu00000001_00000000` (Minecraft). Only lowercase `tu…` files work. Uppercase `TU_…` files (system cache) are not supported, and the trace never showed how they load.
@@ -96,7 +100,7 @@ Details: section "Findings for later work" in `README.md`.
 
 | File | Content |
 |---|---|
-| `NasDlc/nasdlc.cpp` | Source, version 13.3 (13.2 + prefetch test feature) |
+| `NasDlc/nasdlc.cpp` | Source, version 13.4 (13.2 + prefetch test feature + listing trace) |
 | `NasDlc/NasDlc.xml` | XEX configuration |
 | `NasDlc/NasDlc.ini` | Sample settings |
 | `NasDlc.sln`, `NasDlc/NasDlc.vcxproj` | Visual Studio 2010 project |

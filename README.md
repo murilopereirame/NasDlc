@@ -27,7 +27,7 @@ The plugin changes only reads. It does not write to the NAS, and new files (for 
    plugin1 = Usb:\NasDlc.xex
    ```
 3. Change `NasContent` in `NasDlc.ini` to your server and share name.
-4. Start the console. You see the notification `NasDlc v13.3 active`, and later `NAS connected`.
+4. Start the console. You see the notification `NasDlc v13.4 active`, and later `NAS connected`.
 
 ## NAS folder structure
 
@@ -67,7 +67,7 @@ All settings are optional. A missing setting keeps its default value.
 | `[Notify]` | `Found` | `1` | Notifications "N DLC packages found" and "title update loaded". |
 | `[Log]` | `Level` | `1` | `0` = no log, `1` = important lines, `2` = all details. |
 | `[Log]` | `TuTrace` | `0` | Diagnostic: log each title update search of XAM. |
-| `[Log]` | `ContentTrace` | `0` | Diagnostic: log each XAM access to a `\Content\` path, on all devices. |
+| `[Log]` | `ContentTrace` | `0` | Diagnostic: log each XAM access to a `\Content\` path and each listing of a `\Content\` folder, on all devices. |
 | `[Cache]` | `Enabled` | `1` | Header cache. Set to `0` only for a problem search. |
 | `[Cache]` | `Verify` | `0` | Diagnostic: read from the NAS and compare with the cache (slower). |
 | `[Speed]` | `Prefetch` | `0` | Test feature: worker threads fill the cache of each NAS DLC package before XAM opens it. Needs `Cache.Enabled = 1`. |
@@ -79,8 +79,8 @@ Boolean values: `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`.
 
 | Notification | Meaning |
 |---|---|
-| `NasDlc v13.3 active` | The hooks are installed. |
-| `NasDlc v13.3: hook count wrong` | The plugin could not install all hooks. It may not work. Send the log. |
+| `NasDlc v13.4 active` | The hooks are installed. |
+| `NasDlc v13.4: hook count wrong` | The plugin could not install all hooks. It may not work. Send the log. |
 | `NAS connected: DLC and title updates ready` | The NAS share is available. |
 | `NAS: N DLC packages found` | The NAS gave XAM N packages for this game. |
 | `NAS: title update loaded` | XAM opened a title update on the NAS. |
